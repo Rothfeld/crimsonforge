@@ -32,6 +32,7 @@ IDX_FONT = 4
 IDX_AUDIO = 5
 IDX_VIDEO = 6
 IDX_WEB = 7
+IDX_MESH = 8
 
 _WEB_ENGINE_LOADED = False
 _QWebEngineView = None
@@ -154,6 +155,11 @@ class PreviewPane(QWidget):
             self._web_view = _QWebEngineView()
             self._stack.addWidget(self._web_view)
 
+        # IDX_MESH = 8
+        from ui.widgets.mesh_viewer import MeshViewer
+        self._mesh_viewer = MeshViewer()
+        self._stack.addWidget(self._mesh_viewer)
+
         self._stack.setCurrentIndex(IDX_EMPTY)
 
     def preview_file(self, path: str) -> None:
@@ -173,7 +179,30 @@ class PreviewPane(QWidget):
 
         ext = file_info.extension.lower()
 
-        if file_info.category == "image":
+        if ext in (".pam", ".pamlod", ".pac"):
+            self._show_mesh_info(path)
+        elif ext == ".hkx":
+            self._show_havok_info(path)
+        elif ext == ".nav":
+            self._show_nav_info(path)
+        elif ext == ".pab":
+            self._show_skeleton_info(path)
+        elif ext == ".paa" and ext != ".paa_metabin":
+            self._show_animation_info(path)
+        elif ext == ".dds":
+            self._show_image(path)
+            # Append DDS-specific info
+            try:
+                from core.dds_reader import read_dds_info
+                with open(path, "rb") as f:
+                    dds_info = read_dds_info(f.read())
+                self._info_label.setText(
+                    self._info_label.text() +
+                    f"  |  {dds_info.format}  |  {dds_info.width}x{dds_info.height}  |  mips:{dds_info.mip_count}"
+                )
+            except Exception:
+                pass
+        elif file_info.category == "image":
             self._show_image(path)
         elif file_info.category == "audio":
             self._show_audio(path)
@@ -197,9 +226,88 @@ class PreviewPane(QWidget):
         self._empty_label.setText(message)
         self._stack.setCurrentIndex(IDX_EMPTY)
 
+    def _show_havok_info(self, path: str) -> None:
+        """Show Havok HKX file info with bone names."""
+        try:
+            from core.havok_parser import get_hkx_summary
+            with open(path, "rb") as f:
+                summary = get_hkx_summary(f.read())
+            self._text_edit.setPlainText(summary)
+            self._stack.setCurrentIndex(IDX_TEXT)
+        except Exception as e:
+            self._show_empty(f"HKX parse error: {e}")
+
+    def _show_nav_info(self, path: str) -> None:
+        """Show navigation mesh info."""
+        try:
+            from core.navmesh_parser import get_nav_summary
+            with open(path, "rb") as f:
+                summary = get_nav_summary(f.read())
+            self._text_edit.setPlainText(summary)
+            self._stack.setCurrentIndex(IDX_TEXT)
+        except Exception as e:
+            self._show_empty(f"NAV parse error: {e}")
+
+    def _show_skeleton_info(self, path: str) -> None:
+        """Show PAB skeleton bone hierarchy."""
+        try:
+            from core.skeleton_parser import parse_pab
+            with open(path, "rb") as f:
+                data = f.read()
+            if data[:4] != b"PAR ":
+                self._show_empty("Not a valid PAB skeleton file")
+                return
+            skel = parse_pab(data, os.path.basename(path))
+            lines = [
+                f"=== PAB Skeleton ===",
+                f"Bones: {len(skel.bones)}",
+                f"",
+            ]
+            for b in skel.bones:
+                parent = skel.bones[b.parent_index].name if 0 <= b.parent_index < len(skel.bones) else "ROOT"
+                indent = "  " * min(4, b.index // 10)
+                lines.append(f"{indent}[{b.index:3d}] {b.name} -> {parent}")
+            self._text_edit.setPlainText("\n".join(lines))
+            self._stack.setCurrentIndex(IDX_TEXT)
+        except Exception as e:
+            self._show_empty(f"PAB parse error: {e}")
+
+    def _show_animation_info(self, path: str) -> None:
+        """Show PAA animation info."""
+        try:
+            from core.animation_parser import parse_paa
+            with open(path, "rb") as f:
+                data = f.read()
+            if data[:4] != b"PAR ":
+                self._show_empty("Not a valid PAA animation file")
+                return
+            anim = parse_paa(data, os.path.basename(path))
+            lines = [
+                f"=== PAA Animation ===",
+                f"Duration: {anim.duration:.2f}s",
+                f"Frames: {anim.frame_count}",
+                f"Bones: {anim.bone_count}",
+                f"Quaternions: {len(anim.raw_quaternions)}",
+                f"",
+            ]
+            if anim.keyframes:
+                lines.append("First frame bone rotations:")
+                kf = anim.keyframes[0]
+                for i, (qx, qy, qz, qw) in enumerate(kf.bone_rotations[:10]):
+                    lines.append(f"  Bone {i}: ({qx:.4f}, {qy:.4f}, {qz:.4f}, {qw:.4f})")
+                if len(kf.bone_rotations) > 10:
+                    lines.append(f"  ... and {len(kf.bone_rotations) - 10} more")
+            self._text_edit.setPlainText("\n".join(lines))
+            self._stack.setCurrentIndex(IDX_TEXT)
+        except Exception as e:
+            self._show_empty(f"PAA parse error: {e}")
+
     def _show_image(self, path: str) -> None:
         ext = os.path.splitext(path)[1].lower()
         pixmap = QPixmap(path)
+
+        if pixmap.isNull() and ext == ".dds":
+            pixmap = self._decode_dds_native(path)
 
         if pixmap.isNull() and ext in (".dds", ".tga"):
             pixmap = self._convert_image_with_pillow(path)
@@ -217,6 +325,156 @@ class PreviewPane(QWidget):
             self._info_label.text() + f"  |  {pixmap.width()}x{pixmap.height()}"
         )
         self._stack.setCurrentIndex(IDX_IMAGE)
+
+    def _show_mesh_info(self, path: str) -> None:
+        """Render a static 3D preview image of the mesh."""
+        try:
+            from core.mesh_parser import parse_mesh
+
+            with open(path, "rb") as f:
+                data = f.read()
+            mesh = parse_mesh(data, os.path.basename(path))
+
+            if not mesh.submeshes:
+                self._show_empty("No geometry found in this mesh file")
+                return
+
+            # Render to a static image (fast — no interactive 3D)
+            pixmap = self._render_mesh_image(mesh)
+            if pixmap and not pixmap.isNull():
+                self._image_label.setPixmap(pixmap)
+                self._info_label.setText(
+                    self._info_label.text() +
+                    f"  |  {mesh.total_vertices:,} verts  |  {mesh.total_faces:,} faces  |  "
+                    f"{len(mesh.submeshes)} submesh(es)"
+                )
+                self._stack.setCurrentIndex(IDX_IMAGE)
+            else:
+                self._show_empty("Could not render mesh preview")
+        except Exception as e:
+            self._show_empty(f"Mesh parse error: {e}")
+
+    def _render_mesh_image(self, mesh) -> "QPixmap":
+        """Render mesh to a static QPixmap with shaded faces."""
+        import math
+        from PySide6.QtCore import QPointF
+        from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QPolygonF
+
+        w, h = 512, 512
+        pixmap = QPixmap(w, h)
+        pixmap.fill(QColor(24, 24, 37))
+
+        # Merge all submesh geometry
+        all_verts = []
+        all_faces = []
+        offset = 0
+        for sm in mesh.submeshes:
+            all_verts.extend(sm.vertices)
+            for a, b, c in sm.faces:
+                all_faces.append((a + offset, b + offset, c + offset))
+            offset += len(sm.vertices)
+
+        if not all_verts or not all_faces:
+            return pixmap
+
+        # Compute center and scale
+        xs = [v[0] for v in all_verts]
+        ys = [v[1] for v in all_verts]
+        zs = [v[2] for v in all_verts]
+        cx = (min(xs) + max(xs)) / 2
+        cy = (min(ys) + max(ys)) / 2
+        cz = (min(zs) + max(zs)) / 2
+        extent = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs), 0.001)
+        scale = (min(w, h) * 0.38) / extent
+
+        # Rotation: 35° Y, -25° X for a nice 3/4 view
+        ry = math.radians(35)
+        rx = math.radians(-25)
+        cos_y, sin_y = math.cos(ry), math.sin(ry)
+        cos_x, sin_x = math.cos(rx), math.sin(rx)
+
+        def project(vx, vy, vz):
+            x = (vx - cx) * scale
+            y = (vy - cy) * scale
+            z = (vz - cz) * scale
+            x2 = x * cos_y + z * sin_y
+            z2 = -x * sin_y + z * cos_y
+            y2 = y * cos_x - z2 * sin_x
+            z3 = y * sin_x + z2 * cos_x
+            return (w / 2 + x2, h / 2 - y2, z3)
+
+        # Project all vertices
+        projected = [project(*v) for v in all_verts]
+
+        # Sort faces back-to-front
+        light = (0.3, 0.7, 0.5)
+        ln = math.sqrt(sum(l * l for l in light))
+        light = tuple(l / ln for l in light)
+
+        face_data = []
+        for a, b, c in all_faces:
+            if a >= len(projected) or b >= len(projected) or c >= len(projected):
+                continue
+            p0, p1, p2 = projected[a], projected[b], projected[c]
+            avg_z = (p0[2] + p1[2] + p2[2]) / 3
+
+            # Face normal
+            v0, v1, v2 = all_verts[a], all_verts[b], all_verts[c]
+            nx = (v1[1]-v0[1])*(v2[2]-v0[2]) - (v1[2]-v0[2])*(v2[1]-v0[1])
+            ny = (v1[2]-v0[2])*(v2[0]-v0[0]) - (v1[0]-v0[0])*(v2[2]-v0[2])
+            nz = (v1[0]-v0[0])*(v2[1]-v0[1]) - (v1[1]-v0[1])*(v2[0]-v0[0])
+            nl = math.sqrt(nx*nx + ny*ny + nz*nz)
+            if nl > 1e-8:
+                dot = max(0.15, (nx*light[0] + ny*light[1] + nz*light[2]) / nl)
+            else:
+                dot = 0.4
+
+            face_data.append((avg_z, p0, p1, p2, dot))
+
+        face_data.sort(key=lambda f: f[0])
+
+        # Draw
+        p = QPainter(pixmap)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        # Limit faces for performance (sample if too many)
+        max_faces = 50000
+        if len(face_data) > max_faces:
+            step = len(face_data) // max_faces
+            face_data = face_data[::step]
+
+        for _, p0, p1, p2, dot in face_data:
+            r = int(min(255, 70 + 110 * dot))
+            g = int(min(255, 110 + 90 * dot))
+            b_col = int(min(255, 170 + 70 * dot))
+
+            p.setBrush(QBrush(QColor(r, g, b_col, 230)))
+            p.setPen(QPen(QColor(35, 38, 52), 0.3))
+            poly = QPolygonF([QPointF(p0[0], p0[1]), QPointF(p1[0], p1[1]), QPointF(p2[0], p2[1])])
+            p.drawPolygon(poly)
+
+        # Overlay info
+        p.setPen(QColor(166, 173, 200))
+        p.drawText(10, 20, f"{mesh.total_vertices:,} verts | {mesh.total_faces:,} faces")
+        p.drawText(10, 36, f"{len(mesh.submeshes)} submesh(es) | Right-click to export OBJ/FBX")
+        p.end()
+
+        return pixmap
+
+    def _decode_dds_native(self, path: str) -> QPixmap:
+        """Decode DDS using our built-in decoder (no Pillow needed)."""
+        try:
+            from core.dds_reader import decode_dds_to_rgba
+            from PySide6.QtGui import QImage
+
+            with open(path, "rb") as f:
+                data = f.read()
+
+            w, h, rgba = decode_dds_to_rgba(data)
+            img = QImage(rgba, w, h, w * 4, QImage.Format_RGBA8888)
+            return QPixmap.fromImage(img)
+        except Exception:
+            return QPixmap()
 
     def _convert_image_with_pillow(self, path: str) -> QPixmap:
         """Convert DDS/TGA/other formats to QPixmap via Pillow."""

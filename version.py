@@ -17,11 +17,63 @@ VERSION BUMPING RULES
 __all__ = ["APP_VERSION", "APP_NAME", "CHANGELOG"]
 
 APP_NAME = "CrimsonForge"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.7.0"
 
 # Each entry: (version, date, list_of_changes)
 # Newest first. `date` is YYYY-MM-DD.
 CHANGELOG: list[tuple[str, str, list[str]]] = [
+    (
+        "1.7.0", "2026-03-31", [
+            # ── Localization Tracer ──
+            "[Feature] Localization Tracer: standalone tool — type any text, instantly see every screen it appears on in-game",
+            "[Feature] Tracer shows the full chain for each hit: which UI screen, which element, what CSS styling, what font and color",
+            "[Feature] 182 game screens mapped to readable names (Character Select, Skill Tree, World Map, Alert Popup, etc.)",
+            "[Feature] Three search modes: search by displayed text, by paloc key ID, or by UI binding name",
+            "[Feature] When a string appears on multiple screens, all locations are listed with descriptions",
+            "[Feature] All 170 CSS, 153 HTML, and 29 template files decrypted and indexed on startup",
+
+            # ── Game UI System ──
+            "[Feature] Full game UI system reverse-engineered: HTML/CSS-based with custom localstring binding to paloc entries",
+            "[Feature] Per-language CSS files identified — each language has its own font rules and line-breaking behavior",
+            "[Feature] Widget template system mapped: reusable KeyGuide, Modal, ItemTooltip components with text overrides",
+            "[Feature] 115 UI text bindings cataloged (Save/Load, Exit, Confirm, Cancel, menu labels, skill names, shop titles, etc.)",
+            "[Feature] Runtime template variables documented: keybind display, currency icons, clickable game-term links",
+
+            # ── 3D Mesh ──
+            "[Feature] Extract and preview all 12,724 skinned character meshes (.pac) from game archives",
+            "[Feature] Extract and preview 50,388 static meshes (.pam) including props, terrain, and breakable objects",
+            "[Feature] Extract and preview 32,188 LOD mesh variants (.pamlod) with multiple quality levels",
+            "[Feature] Export any mesh to OBJ (Wavefront) or FBX (binary 7.4) from Explorer right-click menu",
+            "[Feature] FBX export auto-finds and embeds the matching skeleton with full bone hierarchy",
+            "[Feature] Mesh preview shows 3D render, vertex/face counts, submesh list, materials, and textures",
+            "[Feature] Breakable and destructible object meshes now extract correctly",
+
+            # ── Textures ──
+            "[Feature] Preview all 279,515 DDS textures directly in Explorer — no external tools needed",
+            "[Feature] Supports all game texture formats: color, normal maps, roughness, heightmaps, distance fields",
+            "[Feature] Grayscale and terrain textures render as preview instead of showing an error",
+
+            # ── Skeleton / Animation / Havok ──
+            "[Feature] Extract skeleton data (.pab): bone names, parent hierarchy, bind poses, transforms",
+            "[Feature] Extract animation data (.paa): keyframes, bone rotations, frame count, duration",
+            "[Feature] Extract Havok data (.hkx): bone names, skeleton hierarchy, content type (skeleton/animation/physics/ragdoll)",
+            "[Feature] Preview all skeleton, animation, and Havok files directly in Explorer",
+
+            # ── File Support ──
+            "[Feature] 108 game file extensions recognized with category, description, and preview/edit support",
+        ],
+    ),
+    (
+        "1.6.0", "2026-03-30", [
+            "[Feature] OBJ export with materials, UVs, normals, and multi-submesh support",
+            "[Feature] FBX binary 7.4 export compatible with Blender, Maya, 3ds Max, Unity, Unreal Engine",
+            "[Feature] Right-click Export as OBJ / Export as FBX on any mesh file in Explorer",
+            "[Feature] DDS texture header info: format name, resolution, mipmap count, alpha channel",
+            "[Feature] Mesh preview in Explorer with static 3D render and geometry statistics",
+            "[Feature] Split export option: save each submesh as a separate OBJ file",
+            "[Feature] Custom scale factor for mesh export",
+        ],
+    ),
     (
         "1.5.0", "2026-03-30", [
             "[Feature] Ship to App: generate ZIP+BAT packages for end-user mod distribution",

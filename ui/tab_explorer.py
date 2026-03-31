@@ -40,14 +40,22 @@ ALL_PACKAGES = "All Packages"
 
 FILE_TYPE_FILTERS = {
     "All Files": set(),
-    "Localization": {".paloc"},
-    "Stylesheets": {".css"},
-    "HTML/Templates": {".html", ".thtml"},
-    "XML/Config": {".xml", ".json"},
-    "Fonts": {".ttf", ".otf", ".woff", ".woff2"},
-    "Images": {".png", ".jpg", ".jpeg", ".bmp", ".tga", ".dds", ".webp", ".gif"},
+    "3D Meshes": {".pam", ".pamlod", ".pac", ".pab", ".pabc", ".pami", ".meshinfo"},
+    "Textures": {".dds", ".png", ".jpg", ".jpeg", ".bmp", ".tga", ".webp", ".gif"},
     "Audio": {".wav", ".ogg", ".mp3", ".wem", ".bnk", ".pasound", ".flac", ".aac"},
     "Video": {".mp4", ".webm", ".avi", ".mkv", ".bk2", ".bik", ".usm"},
+    "Animation": {".paa", ".paa_metabin", ".hkx", ".motionblending"},
+    "Localization": {".paloc"},
+    "UI / Web": {".css", ".html", ".thtml", ".xml", ".json", ".uianiminit"},
+    "Materials": {".mi", ".material", ".technique", ".impostor"},
+    "Fonts": {".ttf", ".otf", ".woff", ".woff2"},
+    "Effects": {".pae", ".paem"},
+    "Level / World": {".palevel", ".levelinfo", ".prefab", ".nav", ".road", ".roadsector", ".roadidx"},
+    "Game Data": {".pabgb", ".pabgh", ".binarygimmick", ".binarystring", ".questgaugecount"},
+    "Sequencer": {".paseq", ".paseqc", ".paseqh", ".seqmt", ".pastage", ".paschedule", ".paschedulepath"},
+    "Physics": {".pbd", ".pat"},
+    "Shaders": {".padxil"},
+    "Splines": {".spline", ".spline2d"},
 }
 
 _COL_FILE = 0
@@ -118,17 +126,41 @@ class _ArchiveModel(QAbstractTableModel):
         self.endResetModel()
 
     def _refilter(self):
+        import fnmatch as _fn
         ext_set = self._ext_set
         search = self._search_text
         if not ext_set and not search:
             self._filtered = list(range(len(self._all_rows)))
             return
+
+        # Parse search: support wildcards and ext: prefix
+        search_ext = ""
+        search_text = search
+        if search.startswith("ext:"):
+            # ext:.dds or ext:dds
+            search_ext = search[4:].strip()
+            if search_ext and not search_ext.startswith("."):
+                search_ext = "." + search_ext
+            search_text = ""
+        elif search.startswith(".") and " " not in search and len(search) < 15:
+            # Typing just ".dds" filters by extension
+            search_ext = search
+            search_text = ""
+
+        use_glob = "*" in search_text or "?" in search_text
+
         result = []
         for i, row in enumerate(self._all_rows):
             if ext_set and row.ext not in ext_set:
                 continue
-            if search and search not in row.path_lower:
+            if search_ext and row.ext != search_ext:
                 continue
+            if search_text:
+                if use_glob:
+                    if not _fn.fnmatch(row.path_lower, search_text):
+                        continue
+                elif search_text not in row.path_lower:
+                    continue
             result.append(i)
         self._filtered = result
 
@@ -289,8 +321,16 @@ class ExplorerTab(QWidget):
 
         toolbar.addWidget(QLabel("Search:"))
         self._search_input = QLineEdit()
-        self._search_input.setPlaceholderText("Search files...")
-        self._search_input.setToolTip("Search files by name. Case-insensitive substring match.")
+        self._search_input.setPlaceholderText("Search: name, *.dds, ext:.pam, *sword*...")
+        self._search_input.setToolTip(
+            "Search files by name or pattern:\n"
+            "  sword         — files containing 'sword'\n"
+            "  *.dds         — wildcard glob pattern\n"
+            "  *armor*sword* — multiple wildcards\n"
+            "  .pam          — filter by extension\n"
+            "  ext:.dds      — explicit extension filter\n"
+            "Case-insensitive."
+        )
         self._search_input.textChanged.connect(lambda _: self._search_timer.start())
         toolbar.addWidget(self._search_input, 1)
 
@@ -522,6 +562,19 @@ class ExplorerTab(QWidget):
             menu.addSeparator()
         menu.addAction("Check All").triggered.connect(lambda: self._model.check_all(True))
         menu.addAction("Uncheck All").triggered.connect(lambda: self._model.check_all(False))
+
+        # Mesh export options for .pam/.pamlod/.pac files
+        if rows and len(rows) == 1:
+            row_data = self._model.row_at(rows[0])
+            if row_data:
+                from core.mesh_parser import is_mesh_file
+                if is_mesh_file(row_data.entry.path):
+                    menu.addSeparator()
+                    export_obj_act = menu.addAction("Export as OBJ")
+                    export_obj_act.triggered.connect(lambda: self._export_mesh(row_data.entry, "obj"))
+                    export_fbx_act = menu.addAction("Export as FBX")
+                    export_fbx_act.triggered.connect(lambda: self._export_mesh(row_data.entry, "fbx"))
+
         menu.exec(self._view.viewport().mapToGlobal(pos))
 
     def _on_archive_row_changed(self, current: QModelIndex, _previous: QModelIndex):
@@ -560,6 +613,81 @@ class ExplorerTab(QWidget):
         except Exception as e:
             self._progress.set_status(f"Preview error: {e}")
             logger.error("Preview error for %s: %s", entry.path, e)
+
+    def _export_mesh(self, entry: PamtFileEntry, fmt: str):
+        """Export a mesh file to OBJ or FBX."""
+        from ui.dialogs.file_picker import pick_directory
+        output_dir = pick_directory(self, "Select Export Directory")
+        if not output_dir:
+            return
+
+        try:
+            self._progress.set_status(f"Exporting {os.path.basename(entry.path)} as {fmt.upper()}...")
+            data = self._vfs.read_entry_data(entry)
+
+            from core.mesh_parser import parse_mesh
+            mesh = parse_mesh(data, entry.path)
+
+            if not mesh.submeshes:
+                from ui.dialogs.confirmation import show_error
+                show_error(self, "Export Error", "No geometry found in this file.")
+                return
+
+            basename = os.path.splitext(os.path.basename(entry.path))[0]
+
+            # Try to find matching skeleton (.pab) for PAC files
+            skeleton = None
+            bone_count = 0
+            if entry.path.lower().endswith(".pac") and fmt == "fbx":
+                pab_path = entry.path.replace(".pac", ".pab")
+                # Search all loaded PAMTs for matching .pab
+                for _g, pamt_data in self._vfs._pamt_cache.items():
+                    from core.pamt_parser import find_file_entry
+                    pab_entry = find_file_entry(pamt_data, pab_path)
+                    if pab_entry:
+                        try:
+                            from core.skeleton_parser import parse_pab
+                            pab_data = self._vfs.read_entry_data(pab_entry)
+                            if pab_data[:4] == b"PAR ":
+                                skeleton = parse_pab(pab_data, pab_path)
+                                bone_count = len(skeleton.bones)
+                        except Exception:
+                            pass
+                        break
+
+            if fmt == "obj":
+                from core.mesh_exporter import export_obj
+                export_obj(mesh, output_dir, basename)
+                self._progress.set_status(
+                    f"Exported OBJ: {mesh.total_vertices:,} verts, {mesh.total_faces:,} faces"
+                )
+            elif skeleton and skeleton.bones:
+                from core.mesh_exporter import export_fbx_with_skeleton
+                export_fbx_with_skeleton(mesh, skeleton, output_dir, basename)
+                self._progress.set_status(
+                    f"Exported FBX: {mesh.total_vertices:,} verts, {mesh.total_faces:,} faces, {bone_count} bones"
+                )
+            else:
+                from core.mesh_exporter import export_fbx
+                export_fbx(mesh, output_dir, basename)
+                self._progress.set_status(
+                    f"Exported FBX: {mesh.total_vertices:,} verts, {mesh.total_faces:,} faces"
+                )
+
+            from ui.dialogs.confirmation import show_info
+            bone_msg = f"\nBones: {bone_count}" if bone_count > 0 else ""
+            show_info(self, "Export Complete",
+                      f"Exported {basename}.{fmt} to:\n{output_dir}\n\n"
+                      f"Vertices: {mesh.total_vertices:,}\n"
+                      f"Faces: {mesh.total_faces:,}\n"
+                      f"Submeshes: {len(mesh.submeshes)}\n"
+                      f"UVs: {'Yes' if mesh.has_uvs else 'No'}{bone_msg}")
+
+        except Exception as e:
+            self._progress.set_status(f"Export error: {e}")
+            logger.error("Mesh export error for %s: %s", entry.path, e)
+            from ui.dialogs.confirmation import show_error
+            show_error(self, "Export Error", str(e))
 
     def _open_archive_in_editor(self, entry: PamtFileEntry):
         try:

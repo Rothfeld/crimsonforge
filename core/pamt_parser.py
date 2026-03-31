@@ -53,9 +53,10 @@ class PamtFileEntry:
     @property
     def encrypted(self) -> bool:
         """Files with certain extensions are ChaCha20-encrypted.
-        The game encrypts paloc, xml, css, html, thtml files."""
+        The game encrypts paloc, xml, css, html, thtml, and pami files."""
         ext = os.path.splitext(self.path.lower())[1]
-        return ext in (".xml", ".paloc", ".css", ".html", ".thtml")
+        return ext in (".xml", ".paloc", ".css", ".html", ".thtml", ".pami",
+                       ".uianiminit", ".spline2d", ".spline", ".mi", ".txt")
 
 
 @dataclass
