@@ -119,31 +119,77 @@ def import_obj(obj_path: str) -> ParsedMesh:
             "faces_global": current_faces_global,
         })
 
-    # Convert global indices to per-submesh local indices
-    for sm_data in submesh_list:
-        # Collect unique vertex indices used by this submesh
-        used_verts = {}  # global_vi -> local_vi
-        used_uvs = {}
-        local_verts = []
-        local_uvs = []
-        local_normals = []
-        local_faces = []
+    # Convert global indices to per-submesh local indices.
+    # Key: keep ALL vertices in each submesh's range (not just face-referenced ones).
+    # Some meshes have unused vertices that must be preserved for correct rebuild.
 
+    # First, determine vertex ownership: each submesh "owns" a contiguous range
+    # based on the order vertices appear in the OBJ (submesh 0 first, etc.)
+    vert_offset = 0
+    for sm_data in submesh_list:
+        # Count vertices that belong to this submesh in the OBJ
+        # (vertices appear between 'o' markers, counted during parse above)
+        # We stored them in all_verts in order — need to find this submesh's range
+        pass
+
+    # Build vertex ranges from the OBJ structure:
+    # Vertices between successive 'o' markers belong to that submesh
+    # Re-parse to find vertex counts per submesh
+    sm_vert_counts = []
+    sm_uv_counts = []
+    sm_normal_counts = []
+    current_v = current_vt = current_vn = 0
+
+    with open(obj_path, "r", encoding="utf-8") as f:
+        in_submesh = False
+        for line in f:
+            line = line.strip()
+            if line.startswith("o "):
+                if in_submesh:
+                    sm_vert_counts.append(current_v)
+                    sm_uv_counts.append(current_vt)
+                    sm_normal_counts.append(current_vn)
+                current_v = current_vt = current_vn = 0
+                in_submesh = True
+            elif line.startswith("v ") and not line.startswith("vt") and not line.startswith("vn"):
+                current_v += 1
+            elif line.startswith("vt "):
+                current_vt += 1
+            elif line.startswith("vn "):
+                current_vn += 1
+        if in_submesh:
+            sm_vert_counts.append(current_v)
+            sm_uv_counts.append(current_vt)
+            sm_normal_counts.append(current_vn)
+
+    # Now build each submesh using the FULL vertex range (not just face-referenced)
+    v_offset = 0
+    vt_offset = 0
+    vn_offset = 0
+
+    for si, sm_data in enumerate(submesh_list):
+        nv = sm_vert_counts[si] if si < len(sm_vert_counts) else 0
+        nvt = sm_uv_counts[si] if si < len(sm_uv_counts) else 0
+        nvn = sm_normal_counts[si] if si < len(sm_normal_counts) else 0
+
+        # ALL vertices in this submesh's range
+        local_verts = [all_verts[v_offset + i] if (v_offset + i) < len(all_verts) else (0, 0, 0)
+                       for i in range(nv)]
+        local_uvs = [all_uvs[vt_offset + i] if (vt_offset + i) < len(all_uvs) else (0, 0)
+                     for i in range(nvt)]
+        local_normals = [all_normals[vn_offset + i] if (vn_offset + i) < len(all_normals) else (0, 1, 0)
+                         for i in range(nvn)]
+
+        # Remap face indices from global to local (subtract offset)
+        local_faces = []
         for face in sm_data["faces_global"]:
             local_face = []
             for vi, ti, ni in face:
-                if vi not in used_verts:
-                    used_verts[vi] = len(local_verts)
-                    local_verts.append(all_verts[vi] if vi < len(all_verts) else (0, 0, 0))
-                    # UV: use same local index as vertex
-                    if ti >= 0 and ti < len(all_uvs):
-                        local_uvs.append(all_uvs[ti])
-                    elif vi < len(all_uvs):
-                        local_uvs.append(all_uvs[vi])
-                    # Normal
-                    if ni >= 0 and ni < len(all_normals):
-                        local_normals.append(all_normals[ni])
-                local_face.append(used_verts[vi])
+                local_vi = vi - v_offset
+                if 0 <= local_vi < nv:
+                    local_face.append(local_vi)
+                else:
+                    local_face.append(0)  # safety fallback
             if len(local_face) == 3:
                 local_faces.append(tuple(local_face))
 
@@ -158,6 +204,10 @@ def import_obj(obj_path: str) -> ParsedMesh:
             face_count=len(local_faces),
         )
         submeshes.append(sm)
+
+        v_offset += nv
+        vt_offset += nvt
+        vn_offset += nvn
 
     result = ParsedMesh(
         path=source_path,
@@ -473,108 +523,96 @@ def _rebuild_pac_section0(orig_s0: bytearray, original_data: bytes,
 # ═══════════════════════════════════════════════════════════════════════
 
 def build_pam(mesh: ParsedMesh, original_data: bytes) -> bytes:
-    """Rebuild a PAM binary from modified mesh + original file data.
+    """Rebuild a PAM binary by patching vertex positions in-place.
 
-    Preserves original header structure, updates geometry data.
+    Instead of rebuilding geometry from scratch (which breaks scan-fallback
+    parsed files), we parse the original to find where each vertex lives
+    in the binary, then overwrite just the position uint16 values.
+    This preserves all other data (indices, UVs, normals, metadata).
     """
     if not original_data or original_data[:4] != b"PAR ":
         raise ValueError("Original PAM data required for rebuild")
 
-    HDR_MESH_COUNT = 0x10
     HDR_BBOX_MIN = 0x14
     HDR_BBOX_MAX = 0x20
     HDR_GEOM_OFF = 0x3C
-    SUBMESH_TABLE = 0x410
-    SUBMESH_STRIDE = 0x218
 
     result = bytearray(original_data)
 
-    # Update global bounding box
+    # Read original bbox — use for quantization, expand only if needed
+    orig_bmin = struct.unpack_from("<fff", original_data, HDR_BBOX_MIN)
+    orig_bmax = struct.unpack_from("<fff", original_data, HDR_BBOX_MAX)
+
+    bmin, bmax = orig_bmin, orig_bmax
     if mesh.submeshes:
         all_v = [v for s in mesh.submeshes for v in s.vertices]
         if all_v:
             xs, ys, zs = zip(*all_v)
-            struct.pack_into("<fff", result, HDR_BBOX_MIN, min(xs), min(ys), min(zs))
-            struct.pack_into("<fff", result, HDR_BBOX_MAX, max(xs), max(ys), max(zs))
+            bmin = (min(orig_bmin[0], min(xs)), min(orig_bmin[1], min(ys)),
+                    min(orig_bmin[2], min(zs)))
+            bmax = (max(orig_bmax[0], max(xs)), max(orig_bmax[1], max(ys)),
+                    max(orig_bmax[2], max(zs)))
+            struct.pack_into("<fff", result, HDR_BBOX_MIN, *bmin)
+            struct.pack_into("<fff", result, HDR_BBOX_MAX, *bmax)
 
-    bmin = struct.unpack_from("<fff", result, HDR_BBOX_MIN)
-    bmax = struct.unpack_from("<fff", result, HDR_BBOX_MAX)
-    geom_off = struct.unpack_from("<I", result, HDR_GEOM_OFF)[0]
-    mesh_count = struct.unpack_from("<I", result, HDR_MESH_COUNT)[0]
-
-    if mesh_count == 0 or not mesh.submeshes:
-        return bytes(result)
-
-    # Detect original stride
+    # Parse the original to find exact vertex byte positions.
+    # Instead of computing offsets ourselves, we find each vertex by
+    # reverse-searching its quantized uint16 position in the binary.
     orig_mesh = parse_pam(original_data, mesh.path)
     if not orig_mesh.submeshes:
         return bytes(result)
 
-    # Rebuild geometry: combined vertex buffer + index buffer
-    total_verts = sum(len(s.vertices) for s in mesh.submeshes)
-    total_idx = sum(len(s.faces) * 3 for s in mesh.submeshes)
+    geom_off = struct.unpack_from("<I", original_data, HDR_GEOM_OFF)[0]
 
-    avail = len(original_data) - geom_off
-    if total_verts > 0:
-        stride = (avail - total_idx * 2) // total_verts
-        stride = max(6, min(64, stride))
-    else:
-        return bytes(result)
+    # For each original vertex, find its byte offset by matching its
+    # quantized uint16 values. Build a map: (submesh_idx, vert_idx) → byte_offset
+    vert_offsets = []
+    search_start = geom_off
 
-    # Build new geometry buffer
-    geom_buf = bytearray()
+    for sm_idx, (orig_sm, new_sm) in enumerate(zip(orig_mesh.submeshes, mesh.submeshes)):
+        n = min(len(orig_sm.vertices), len(new_sm.vertices))
+        sm_offsets = []
 
-    ve_acc = 0
-    ie_acc = 0
-    for sm_idx, sm in enumerate(mesh.submeshes):
-        nv = len(sm.vertices)
-        ni = len(sm.faces) * 3
-        has_uv = stride >= 12
+        for vi in range(len(orig_sm.vertices)):
+            vx, vy, vz = orig_sm.vertices[vi]
+            # Quantize original vertex to find its uint16 pattern
+            xu = _quantize_u16(vx, orig_bmin[0], orig_bmax[0])
+            yu = _quantize_u16(vy, orig_bmin[1], orig_bmax[1])
+            zu = _quantize_u16(vz, orig_bmin[2], orig_bmax[2])
+            target = struct.pack("<HHH", xu, yu, zu)
 
-        # Build vertex data
-        for vi in range(nv):
-            vx, vy, vz = sm.vertices[vi]
+            # Search forward from last found position
+            found = -1
+            for scan in range(search_start, len(original_data) - 6):
+                if original_data[scan:scan + 6] == target:
+                    found = scan
+                    search_start = scan + 6  # next search starts after this
+                    break
+
+            sm_offsets.append(found)
+
+        # Patch vertices that have valid offsets
+        patched = 0
+        for vi in range(n):
+            if vi >= len(sm_offsets) or sm_offsets[vi] < 0:
+                continue
+            byte_off = sm_offsets[vi]
+
+            vx, vy, vz = new_sm.vertices[vi]
             xu = _quantize_u16(vx, bmin[0], bmax[0])
             yu = _quantize_u16(vy, bmin[1], bmax[1])
             zu = _quantize_u16(vz, bmin[2], bmax[2])
 
-            rec = bytearray(stride)
-            struct.pack_into("<HHH", rec, 0, xu, yu, zu)
-            if has_uv and vi < len(sm.uvs):
-                try:
-                    struct.pack_into("<e", rec, 8, sm.uvs[vi][0])
-                    struct.pack_into("<e", rec, 10, sm.uvs[vi][1])
-                except (OverflowError, ValueError):
-                    pass
-            geom_buf.extend(rec)
+            if byte_off + 6 <= len(result):
+                struct.pack_into("<HHH", result, byte_off, xu, yu, zu)
+                patched += 1
 
-        # Update submesh table entry
-        if sm_idx < mesh_count and SUBMESH_TABLE + sm_idx * SUBMESH_STRIDE + 12 <= len(result):
-            toff = SUBMESH_TABLE + sm_idx * SUBMESH_STRIDE
-            struct.pack_into("<I", result, toff, nv)
-            struct.pack_into("<I", result, toff + 4, ni)
-            struct.pack_into("<I", result, toff + 8, ve_acc)
-            struct.pack_into("<I", result, toff + 12, ie_acc)
+        vert_offsets.append(patched)
 
-        ve_acc += nv
-        ie_acc += ni
-
-    # Build index buffer
-    idx_buf = bytearray()
-    for sm in mesh.submeshes:
-        for a, b, c in sm.faces:
-            idx_buf.extend(struct.pack("<HHH", a, b, c))
-
-    geom_buf.extend(idx_buf)
-
-    # Replace geometry section
-    new_data = bytearray(result[:geom_off])
-    new_data.extend(geom_buf)
-
-    logger.info("Built PAM %s: %d bytes (%d submeshes, %d verts, %d faces)",
-                mesh.path, len(new_data), len(mesh.submeshes),
-                mesh.total_vertices, mesh.total_faces)
-    return bytes(new_data)
+    total_patched = sum(vert_offsets)
+    logger.info("Built PAM %s: %d bytes (patched %d verts in-place)",
+                mesh.path, len(result), total_patched)
+    return bytes(result)
 
 
 # ═══════════════════════════════════════════════════════════════════════

@@ -34,7 +34,7 @@ class SettingsTab(QWidget):
 
         self._category_list = QListWidget()
         self._category_list.setFixedWidth(160)
-        self._category_list.addItems(["General", "AI Providers", "Translation", "Repack", "Advanced"])
+        self._category_list.addItems(["General", "AI Providers", "Translation", "Audio / TTS", "Repack", "Advanced"])
         self._category_list.currentRowChanged.connect(self._on_category_changed)
         layout.addWidget(self._category_list)
 
@@ -44,6 +44,7 @@ class SettingsTab(QWidget):
         self._stack.addWidget(self._build_general_page())
         self._stack.addWidget(self._build_ai_page())
         self._stack.addWidget(self._build_translation_page())
+        self._stack.addWidget(self._build_audio_tts_page())
         self._stack.addWidget(self._build_repack_page())
         self._stack.addWidget(self._build_advanced_page())
 
@@ -99,10 +100,25 @@ class SettingsTab(QWidget):
             form.addRow("Base URL:", base_url_input)
 
             model_combo = QComboBox()
-            model_combo.setEditable(True)
-            model_combo.setToolTip("The AI model to use for translations. Click 'Load Models' to fetch the available list.\nYou can also type a model name manually.")
-            model_combo.setCurrentText(self._config.get(f"ai_providers.{provider_id}.default_model", ""))
-            form.addRow("Default Model:", model_combo)
+            model_combo.setToolTip("The AI model to use for translations.\nClick 'Load Models' to fetch the available list from the API.")
+            # Pre-populate with saved model so it shows in dropdown
+            saved_model = self._config.get(f"ai_providers.{provider_id}.default_model", "")
+            if saved_model:
+                model_combo.addItem(saved_model, saved_model)
+            form.addRow("Translation Model:", model_combo)
+
+            # TTS Model — only for providers that support TTS
+            from ai.tts_engine import TRANSLATION_PROVIDERS_WITH_TTS
+            tts_model_combo = QComboBox()
+            has_tts = provider_id in TRANSLATION_PROVIDERS_WITH_TTS
+            if has_tts:
+                tts_model_combo.setToolTip("The TTS model for speech generation.\nClick 'Load Models' to fetch available TTS models from the API.")
+                saved_tts = self._config.get(f"ai_providers.{provider_id}.default_tts_model", "")
+                if saved_tts:
+                    tts_model_combo.addItem(saved_tts, saved_tts)
+                form.addRow("TTS Model:", tts_model_combo)
+            else:
+                tts_model_combo.setEnabled(False)
 
             test_btn = QPushButton("Test Connection")
             test_btn.setToolTip("Test the API connection and verify your API key works.")
@@ -114,7 +130,7 @@ class SettingsTab(QWidget):
             form.addRow("", test_row)
 
             load_models_btn = QPushButton("Load Models")
-            load_models_btn.setToolTip("Fetch the list of available models from this provider's API.\nPopulates the model dropdown above.")
+            load_models_btn.setToolTip("Fetch available models from the API and populate both Translation and TTS model dropdowns.")
             form.addRow("", load_models_btn)
 
             self._provider_widgets[provider_id] = {
@@ -122,6 +138,7 @@ class SettingsTab(QWidget):
                 "api_key": api_key_input,
                 "base_url": base_url_input,
                 "model": model_combo,
+                "tts_model": tts_model_combo,
                 "test_result": test_result,
             }
 
@@ -142,20 +159,58 @@ class SettingsTab(QWidget):
                         result_label.setStyleSheet("color: #f38ba8;")
                 return handler
 
-            def make_load_handler(pid, combo):
+            def _auto_select(combo, saved_value):
+                """Auto-select a saved value in a combo box after populating."""
+                if not saved_value:
+                    return
+                for i in range(combo.count()):
+                    if combo.itemData(i) == saved_value or combo.itemText(i) == saved_value:
+                        combo.setCurrentIndex(i)
+                        return
+                combo.setCurrentText(saved_value)
+
+            def make_load_handler(pid, trans_combo, tts_combo):
                 def handler():
                     self._apply_provider_config(pid)
+                    saved_trans = self._config.get(f"ai_providers.{pid}.default_model", "")
+                    saved_tts = self._config.get(f"ai_providers.{pid}.default_tts_model", "")
+
                     try:
+                        # Fetch translation models from API
                         models = self._model_loader.load_models(pid, force_refresh=True)
-                        combo.clear()
+                        trans_combo.clear()
                         for m in models:
-                            combo.addItem(m.name, m.model_id)
+                            trans_combo.addItem(m.name, m.model_id)
+                        _auto_select(trans_combo, saved_trans)
                     except Exception as e:
                         show_error(self, "Error", f"Failed to load models: {e}")
+
+                    # Fetch TTS models (only for providers that support TTS)
+                    from ai.tts_engine import TRANSLATION_PROVIDERS_WITH_TTS, TTS_PROVIDER_CLASSES, TTS_KEY_SHARING
+                    if pid in TRANSLATION_PROVIDERS_WITH_TTS and tts_combo.isEnabled():
+                        try:
+                            # Find the matching TTS provider class
+                            tts_pid = None
+                            for tp, shared in TTS_KEY_SHARING.items():
+                                if shared == pid:
+                                    tts_pid = tp
+                                    break
+
+                            tts_combo.clear()
+                            if tts_pid and tts_pid in TTS_PROVIDER_CLASSES:
+                                key = self._provider_widgets[pid]["api_key"].text()
+                                tts_provider = TTS_PROVIDER_CLASSES[tts_pid](api_key=key)
+                                tts_models = tts_provider.list_models()
+                                for tm in tts_models:
+                                    tts_combo.addItem(tm.name, tm.model_id)
+                            _auto_select(tts_combo, saved_tts)
+                        except Exception as e:
+                            logger.warning("Failed to load TTS models for %s: %s", pid, e)
+
                 return handler
 
             test_btn.clicked.connect(make_test_handler(provider_id, test_result))
-            load_models_btn.clicked.connect(make_load_handler(provider_id, model_combo))
+            load_models_btn.clicked.connect(make_load_handler(provider_id, model_combo, tts_model_combo))
 
             main_layout.addWidget(group)
 
@@ -233,6 +288,45 @@ class SettingsTab(QWidget):
 
         return page
 
+    def _build_audio_tts_page(self) -> QWidget:
+        """Audio / TTS settings page."""
+        page = QWidget()
+        form = QFormLayout(page)
+        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        # ── TTS ──
+        tts_label = QLabel("Text-to-Speech (TTS)")
+        tts_label.setStyleSheet("font-weight: bold; font-size: 13px; padding: 4px 0;")
+        form.addRow(tts_label)
+
+        tts_info = QLabel(
+            "TTS providers are configured in the Audio tab.\n"
+            "Providers that share API keys with AI Providers (OpenAI, Gemini, Mistral)\n"
+            "use the same key. Edge TTS is free and requires no key.\n"
+            "ElevenLabs and Azure Speech need their own API keys."
+        )
+        tts_info.setWordWrap(True)
+        tts_info.setStyleSheet("color: #a6adc8; font-size: 11px; padding: 4px;")
+        form.addRow(tts_info)
+
+        # ElevenLabs API key (TTS-only provider)
+        self._elevenlabs_key = QLineEdit(self._config.get("tts.elevenlabs_tts_api_key", ""))
+        self._elevenlabs_key.setEchoMode(QLineEdit.Password)
+        self._elevenlabs_key.setToolTip("ElevenLabs API key for TTS voice generation.")
+        form.addRow("ElevenLabs Key:", self._elevenlabs_key)
+
+        # Azure Speech key (TTS-only provider)
+        self._azure_speech_key = QLineEdit(self._config.get("tts.azure_tts_api_key", ""))
+        self._azure_speech_key.setEchoMode(QLineEdit.Password)
+        self._azure_speech_key.setToolTip("Azure Speech Service subscription key.")
+        form.addRow("Azure Speech Key:", self._azure_speech_key)
+
+        self._azure_region = QLineEdit(self._config.get("tts.azure_region", "eastus"))
+        self._azure_region.setToolTip("Azure Speech region (e.g. eastus, westeurope).")
+        form.addRow("Azure Region:", self._azure_region)
+
+        return page
+
     def _build_repack_page(self) -> QWidget:
         page = QWidget()
         form = QFormLayout(page)
@@ -286,7 +380,10 @@ class SettingsTab(QWidget):
         self._config.set(f"ai_providers.{provider_id}.enabled", widgets["enabled"].isChecked())
         self._config.set(f"ai_providers.{provider_id}.api_key", widgets["api_key"].text())
         self._config.set(f"ai_providers.{provider_id}.base_url", widgets["base_url"].text())
-        self._config.set(f"ai_providers.{provider_id}.default_model", widgets["model"].currentText())
+        model_id = widgets["model"].currentData() or widgets["model"].currentText()
+        self._config.set(f"ai_providers.{provider_id}.default_model", model_id)
+        tts_id = widgets["tts_model"].currentData() or widgets["tts_model"].currentText()
+        self._config.set(f"ai_providers.{provider_id}.default_tts_model", tts_id)
         self._registry.initialize_from_config(self._config.get_section("ai_providers"))
 
     def _save_settings(self):
@@ -298,7 +395,10 @@ class SettingsTab(QWidget):
             self._config.set(f"ai_providers.{pid}.enabled", widgets["enabled"].isChecked())
             self._config.set(f"ai_providers.{pid}.api_key", widgets["api_key"].text())
             self._config.set(f"ai_providers.{pid}.base_url", widgets["base_url"].text())
-            self._config.set(f"ai_providers.{pid}.default_model", widgets["model"].currentText())
+            model_id = widgets["model"].currentData() or widgets["model"].currentText()
+            self._config.set(f"ai_providers.{pid}.default_model", model_id)
+            tts_id = widgets["tts_model"].currentData() or widgets["tts_model"].currentText()
+            self._config.set(f"ai_providers.{pid}.default_tts_model", tts_id)
 
         self._config.set("translation.autosave_enabled", self._autosave_check.isChecked())
         self._config.set("translation.autosave_interval_seconds", self._autosave_interval.value())
@@ -306,6 +406,10 @@ class SettingsTab(QWidget):
         self._config.set("translation.batch_delay_ms", self._batch_delay.value())
         self._config.set("translation.system_prompt", self._system_prompt.toPlainText())
         self._config.set("translation.user_prompt_template", self._user_prompt.text())
+
+        self._config.set("tts.elevenlabs_tts_api_key", self._elevenlabs_key.text())
+        self._config.set("tts.azure_tts_api_key", self._azure_speech_key.text())
+        self._config.set("tts.azure_region", self._azure_region.text())
 
         self._config.set("repack.auto_backup", self._auto_backup_check.isChecked())
         self._config.set("repack.verify_after_repack", self._verify_check.isChecked())

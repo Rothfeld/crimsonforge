@@ -17,11 +17,83 @@ VERSION BUMPING RULES
 __all__ = ["APP_VERSION", "APP_NAME", "CHANGELOG"]
 
 APP_NAME = "CrimsonForge"
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.10.0"
 
 # Each entry: (version, date, list_of_changes)
 # Newest first. `date` is YYYY-MM-DD.
 CHANGELOG: list[tuple[str, str, list[str]]] = [
+    (
+        "1.10.0", "2026-04-02", [
+            # ── Enterprise Audio Tab ──
+            "[Feature] Enterprise Audio tab: browse, play, export, import, and TTS-generate 107K+ game voice files",
+            "[Feature] Audio index engine: 94.9% of voice files auto-linked to paloc dialogue text in 14 languages",
+            "[Feature] Voice language auto-detection: Korean (pkg 0005), English (pkg 0006), Japanese (pkg 0035)",
+            "[Feature] Audio category filter: Quest Greeting, Quest Main, AI Friendly, AI Ambient, etc.",
+            "[Feature] Click any audio file to see dialogue text in all 14 game languages",
+            "[Feature] Search across all languages: find audio by English, Korean, Arabic, or any translated text",
+            "[Feature] Auto-load translated text into TTS input based on selected language",
+            "[Feature] Generated audio history with click-to-play, save, and clear",
+            "[Feature] Audio export as WAV or OGG with WEM auto-decode via vgmstream",
+            "[Feature] Audio import + Patch to Game with WAV-to-WEM Vorbis conversion via Wwise",
+            "[Feature] Wwise auto-detection from WWISEROOT, Program Files, or PATH",
+            "[Feature] ffmpeg auto-installer: downloads and installs on first use (~80MB)",
+
+            # ── TTS (Text-to-Speech) ──
+            "[Feature] Multi-provider TTS engine: OpenAI, ElevenLabs, Edge TTS (free), Google Cloud, Azure Speech, Mistral Voxtral",
+            "[Feature] All TTS models and voices fetched dynamically from provider APIs (nothing hardcoded)",
+            "[Feature] TTS providers share API keys with translation providers (OpenAI, Gemini, Mistral)",
+            "[Feature] Edge TTS: free, 400+ voices, no API key needed (default provider)",
+            "[Feature] Generate + Patch to Game: TTS generate, convert to WEM, write to archives in one click",
+            "[Feature] Only enabled providers shown in Audio tab TTS dropdown",
+
+            # ── DeepL Translation ──
+            "[Feature] DeepL translation provider (10th provider): superior quality for European languages",
+            "[Feature] DeepL free tier (500K chars/month) and Pro ($25/1M chars) support",
+            "[Feature] DeepL formality control, context parameter, and glossary support",
+
+            # ── Settings ──
+            "[Feature] New Audio/TTS settings page with ElevenLabs and Azure Speech API keys",
+            "[Feature] Per-provider Translation Model + TTS Model dropdowns (proper dropdown, not text box)",
+            "[Feature] Load Models button fetches and populates Translation + TTS model lists with auto-select",
+
+            # ── Translation Tab ──
+            "[Feature] 7 new dialogue sub-categories: Quest Greeting, Quest Main, Quest Side Content, Quest Lines, AI Friendly, AI Ambient, AI Ambient (Group)",
+
+            # ── Mesh Import/Export Fixes ──
+            "[Fix] OBJ importer: vertices kept in sequential order (was scrambled by face-visit order)",
+            "[Fix] OBJ importer: all vertices preserved including face-unreferenced ones",
+            "[Fix] PAM builder: vertex positions patched in-place by pattern matching (100% pass rate)",
+            "[Fix] PAC round-trip: 97% pass rate (28/29 tested files)",
+            "[Fix] FBX binary writer: node end_offset now absolute — Blender opens exports correctly",
+
+            # ── Stability ──
+            "[Fix] App no longer crashes on modded or corrupt game files — decompression failures caught gracefully",
+            "[Fix] Browse and preview works on patched game installs where other mod tools modified PAZ archives",
+        ],
+    ),
+    (
+        "1.9.0", "2026-04-01", [
+            # ── Audio Tab (initial) ──
+            "[Feature] Audio tab: browse, play, and export all game audio files (WEM, BNK, WAV, OGG)",
+            "[Feature] Audio player with full transport controls in Audio tab",
+            "[Feature] Export audio as WAV or OGG from Explorer and Audio tab context menus",
+            "[Feature] Import WAV to replace game audio with one-click Patch to Game",
+            "[Feature] WEM/BNK to WAV conversion via vgmstream-cli (auto-installed)",
+
+            # ── TTS (initial) ──
+            "[Feature] TTS providers: Edge TTS (free), OpenAI TTS, ElevenLabs, Google Cloud TTS, Azure Speech",
+            "[Feature] TTS Generator panel: select provider, voice, language, speed",
+            "[Feature] Replace + Patch to Game: generate TTS and write directly to game archives",
+
+            # ── DeepL Translation ──
+            "[Feature] DeepL translation provider with free tier (500K chars/month) and Pro support",
+            "[Feature] DeepL formality control and context parameter for improved accuracy",
+
+            # ── Stability ──
+            "[Fix] Decompression failures on modded game files caught gracefully instead of crashing",
+            "[Fix] Extract handles corrupt entries by writing raw data instead of crashing",
+        ],
+    ),
     (
         "1.8.0", "2026-04-01", [
             # ── Round-Trip Mesh Modding ──
@@ -30,7 +102,7 @@ CHANGELOG: list[tuple[str, str, list[str]]] = [
             "[Feature] PAM Builder: rebuild PAM binary from modified mesh — preserves header, submesh table, and geometry layout",
             "[Feature] Import OBJ (replace mesh): right-click any .pac/.pam/.pamlod in Explorer to import a modified OBJ",
             "[Feature] Import OBJ + Patch to Game: one-click import, rebuild, compress, encrypt, and write to game archives",
-            "[Feature] Full round-trip pipeline: Export OBJ → edit in Blender → Import OBJ → Patch to Game",
+            "[Feature] Full round-trip pipeline: Export OBJ \u2192 edit in Blender \u2192 Import OBJ \u2192 Patch to Game",
             "[Feature] OBJ export now embeds source_path and source_format comments for re-import identification",
             "[Fix] FBX binary writer: child node end_offset was relative to 0 instead of absolute file position — Blender now opens FBX files correctly",
 

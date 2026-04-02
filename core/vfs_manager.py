@@ -148,8 +148,12 @@ class VfsManager:
             result["decrypted"] = True
 
         if entry.compressed and entry.compression_type != 0:
-            data = decompress(data, entry.orig_size, entry.compression_type)
-            result["decompressed"] = True
+            try:
+                data = decompress(data, entry.orig_size, entry.compression_type)
+                result["decompressed"] = True
+            except (ValueError, Exception) as e:
+                logger.warning("Decompression failed for %s (may be modded/corrupt), "
+                               "extracting raw data: %s", entry.path, e)
 
         rel_path = entry.path.replace("\\", "/").replace("/", os.sep)
         out_path = os.path.join(output_dir, rel_path)
@@ -166,6 +170,8 @@ class VfsManager:
         """Read and process a file entry's data in memory (decrypt + decompress).
 
         Returns the fully processed file data without writing to disk.
+        If decompression fails (modded/corrupt files), returns raw data
+        so the app can still browse and preview other files.
         """
         read_size = entry.comp_size if entry.compressed else entry.orig_size
 
@@ -178,7 +184,13 @@ class VfsManager:
             data = decrypt(data, basename)
 
         if entry.compressed and entry.compression_type != 0:
-            data = decompress(data, entry.orig_size, entry.compression_type)
+            try:
+                data = decompress(data, entry.orig_size, entry.compression_type)
+            except (ValueError, Exception) as e:
+                logger.warning("Decompression failed for %s (may be modded/corrupt): %s",
+                               entry.path, e)
+                # Return raw decrypted data so the app doesn't crash
+                # The file will show as corrupt in preview but won't block browsing
 
         return data
 

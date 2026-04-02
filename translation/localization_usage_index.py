@@ -16,6 +16,13 @@ from core.vfs_manager import VfsManager
 
 
 CATEGORY_DIALOGUE = "Dialogue / Subtitle"
+CATEGORY_QUEST_GREETING = "Quest Greeting"
+CATEGORY_QUEST_MAIN = "Quest Main Dialogue"
+CATEGORY_QUEST_CONTENT = "Quest Side Content"
+CATEGORY_QUEST_LINES = "Quest Lines"
+CATEGORY_AI_FRIENDLY = "AI Friendly"
+CATEGORY_AI_AMBIENT = "AI Ambient"
+CATEGORY_AI_AMBIENT_GROUP = "AI Ambient (Group)"
 CATEGORY_QUESTS = "Quests"
 CATEGORY_SKILLS = "Skills"
 CATEGORY_KNOWLEDGE = "Knowledge / Codex"
@@ -27,6 +34,13 @@ CATEGORY_UNCATEGORIZED = "Uncategorized"
 
 CATEGORY_ORDER = [
     CATEGORY_DIALOGUE,
+    CATEGORY_QUEST_GREETING,
+    CATEGORY_QUEST_MAIN,
+    CATEGORY_QUEST_CONTENT,
+    CATEGORY_QUEST_LINES,
+    CATEGORY_AI_FRIENDLY,
+    CATEGORY_AI_AMBIENT,
+    CATEGORY_AI_AMBIENT_GROUP,
     CATEGORY_QUESTS,
     CATEGORY_SKILLS,
     CATEGORY_KNOWLEDGE,
@@ -160,13 +174,37 @@ class LocalizationUsageIndex:
         for key in symbolic_keys:
             lowered = key.lower()
 
-            if key.startswith((
-                "questdialog_",
-                "aidialogstringinfo_",
-                "aidialogstringinfogroup_",
-                "quest_node_",
-                "onetimequest_",
-            )):
+            # ── Quest Dialogue (voice-acted, linked to .wem audio) ──
+            if key.startswith("questdialog_"):
+                tags[key].add(CATEGORY_DIALOGUE)
+                # Sub-categorize by dialogue type
+                if key.startswith("questdialog_hello_"):
+                    tags[key].add(CATEGORY_QUEST_GREETING)
+                elif key.startswith("questdialog_main_"):
+                    tags[key].add(CATEGORY_QUEST_MAIN)
+                elif key.startswith("questdialog_contents_"):
+                    tags[key].add(CATEGORY_QUEST_CONTENT)
+                elif key.startswith("questdialog_quest_"):
+                    tags[key].add(CATEGORY_QUEST_LINES)
+                elif key.startswith(("questdialog_day2_", "questdialog_pywel_")):
+                    tags[key].add(CATEGORY_QUEST_LINES)
+                else:
+                    tags[key].add(CATEGORY_QUEST_LINES)
+
+            # ── AI Ambient Dialogue (single NPC, voice-acted) ──
+            elif key.startswith("aidialogstringinfogroup_"):
+                tags[key].add(CATEGORY_DIALOGUE)
+                tags[key].add(CATEGORY_AI_AMBIENT_GROUP)
+
+            elif key.startswith("aidialogstringinfo_"):
+                tags[key].add(CATEGORY_DIALOGUE)
+                if "_friendly_" in lowered:
+                    tags[key].add(CATEGORY_AI_FRIENDLY)
+                else:
+                    tags[key].add(CATEGORY_AI_AMBIENT)
+
+            # ── Other dialogue keys ──
+            elif key.startswith(("quest_node_", "onetimequest_")):
                 tags[key].add(CATEGORY_DIALOGUE)
 
             if key.startswith("textdialog_"):

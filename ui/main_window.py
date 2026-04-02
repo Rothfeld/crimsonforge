@@ -27,6 +27,7 @@ from ui.tab_repack import RepackTab
 from ui.tab_translate import TranslateTab
 from ui.tab_font import FontTab
 from ui.tab_settings import SettingsTab
+from ui.tab_audio import AudioTab
 from ui.tab_about import AboutTab
 from ui.themes.dark import DARK_THEME
 from ui.themes.light import LIGHT_THEME
@@ -69,6 +70,7 @@ class MainWindow(QMainWindow):
         self._explorer_tab = ExplorerTab(config)
         self._repack_tab = RepackTab(config)
         self._translate_tab = TranslateTab(config, registry)
+        self._audio_tab = AudioTab(config)
         self._font_tab = FontTab(config)
         self._settings_tab = SettingsTab(config, registry)
         self._about_tab = AboutTab(config=config)
@@ -77,6 +79,7 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._explorer_tab, "Explorer")
         self._tabs.addTab(self._repack_tab, "Repack")
         self._tabs.addTab(self._translate_tab, "Translate")
+        self._tabs.addTab(self._audio_tab, "Audio")
         self._tabs.addTab(self._font_tab, "Font Builder")
         self._tabs.addTab(self._settings_tab, "Settings")
         self._tabs.addTab(self._about_tab, "About")
@@ -408,6 +411,7 @@ class MainWindow(QMainWindow):
             self._repack_tab.initialize_from_game(packages_path)
             self._translate_tab.initialize_from_game(self._vfs, self._discovered_palocs)
             self._font_tab.initialize_from_game(self._vfs)
+            self._audio_tab.initialize_from_game(self._vfs, groups)
 
             self._unlock_tabs()
             self._game_loaded = True

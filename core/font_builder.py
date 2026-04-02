@@ -232,12 +232,14 @@ def _add_glyphs_direct(
 
     stats = {"glyphs_added": 0, "codepoints_mapped": 0, "errors": []}
     total = len(codepoints_to_add)
+    glyph_rename_map = {}  # donor_name → target_name for GSUB/GPOS remapping
 
     for idx, cp in enumerate(codepoints_to_add):
         donor_name = donor_cmap[cp]
         new_name = f"uni{cp:04X}"
         if new_name in target_go:
             new_name = f"u{cp:05X}"
+        glyph_rename_map[donor_name] = new_name
 
         try:
             if donor_name not in donor_glyf:
@@ -290,20 +292,77 @@ def _add_glyphs_direct(
     target_font.setGlyphOrder(target_go)
     target_font["maxp"].numGlyphs = len(target_go)
 
+    # Copy extra glyphs referenced by GSUB/GPOS (ligature products, mark combos, etc.)
     if script_info.needs_gsub:
-        if "GSUB" in target_font and "GSUB" in donor_font:
+        extra = _collect_gsub_gpos_referenced_glyphs(donor_font)
+        target_go = list(target_font.getGlyphOrder())
+        target_go_set = set(target_go)
+        extra_needed = [g for g in extra if g not in target_go_set and g not in glyph_rename_map.values()]
+        extra_added = []
+        for glyph_name in extra_needed:
+            if glyph_name not in donor_glyf:
+                continue
             try:
-                _merge_gsub(target_font, donor_font)
+                src = donor_glyf[glyph_name]
+                if src.numberOfContours == 0 and not src.isComposite():
+                    pen = TTGlyphPen(None)
+                    target_glyf[glyph_name] = pen.glyph()
+                else:
+                    rec_pen = DecomposingRecordingPen(donor_font.getGlyphSet())
+                    donor_font.getGlyphSet()[glyph_name].draw(rec_pen)
+                    pen = TTGlyphPen(None)
+                    if scale != 1.0:
+                        for op, args in rec_pen.value:
+                            if op == "moveTo":
+                                pen.moveTo(*[(int(x * scale), int(y * scale)) for x, y in args])
+                            elif op == "lineTo":
+                                pen.lineTo(*[(int(x * scale), int(y * scale)) for x, y in args])
+                            elif op == "qCurveTo":
+                                pen.qCurveTo(*[(int(x * scale), int(y * scale)) for x, y in args])
+                            elif op == "closePath":
+                                pen.closePath()
+                            elif op == "endPath":
+                                pen.endPath()
+                    else:
+                        rec_pen.replay(pen)
+                    target_glyf[glyph_name] = pen.glyph()
+                if glyph_name in donor_hmtx.metrics:
+                    w, lsb = donor_hmtx.metrics[glyph_name]
+                    target_hmtx.metrics[glyph_name] = (int(w * scale), int(lsb * scale))
+                else:
+                    target_hmtx.metrics[glyph_name] = (600, 0)
+                extra_added.append(glyph_name)
+            except Exception:
+                pass
+        if extra_added:
+            target_go.extend(extra_added)
+            target_font.setGlyphOrder(target_go)
+            target_font["maxp"].numGlyphs = len(target_go)
+            logger.info("Copied %d extra glyphs for GSUB/GPOS references", len(extra_added))
+
+    if script_info.needs_gsub:
+        if "GSUB" in donor_font:
+            try:
+                if "GSUB" not in target_font:
+                    _create_gsub_from_donor(target_font, donor_font, glyph_rename_map)
+                else:
+                    _merge_gsub(target_font, donor_font, glyph_rename_map)
             except Exception as e:
                 stats["errors"].append(f"GSUB merge: {e}")
-        if "GDEF" in target_font and "GDEF" in donor_font:
+        if "GDEF" in donor_font:
             try:
-                _merge_gdef(target_font, donor_font)
+                if "GDEF" not in target_font:
+                    _create_gdef_from_donor(target_font, donor_font, glyph_rename_map)
+                else:
+                    _merge_gdef(target_font, donor_font, glyph_rename_map)
             except Exception as e:
                 stats["errors"].append(f"GDEF merge: {e}")
-        if "GPOS" in target_font and "GPOS" in donor_font:
+        if "GPOS" in donor_font:
             try:
-                _merge_gpos(target_font, donor_font)
+                if "GPOS" not in target_font:
+                    _create_gpos_from_donor(target_font, donor_font, glyph_rename_map)
+                else:
+                    _merge_gpos(target_font, donor_font, glyph_rename_map)
             except Exception as e:
                 stats["errors"].append(f"GPOS merge: {e}")
 
@@ -313,119 +372,340 @@ def _add_glyphs_direct(
     return stats
 
 
+def _collect_gsub_gpos_referenced_glyphs(font):
+    """Collect all glyph names referenced by GSUB and GPOS tables."""
+    glyphs = set()
+    for tag in ("GSUB", "GPOS"):
+        if tag not in font:
+            continue
+        table = font[tag].table
+        for lookup in table.LookupList.Lookup:
+            try:
+                for subtable in lookup.SubTable:
+                    for attr in ("Coverage", "BaseCoverage", "MarkCoverage", "LigatureCoverage"):
+                        cov = getattr(subtable, attr, None)
+                        if cov and hasattr(cov, "glyphs"):
+                            glyphs.update(cov.glyphs)
+                    for attr in ("BacktrackCoverage", "LookAheadCoverage", "InputCoverage"):
+                        covs = getattr(subtable, attr, None)
+                        if covs:
+                            for c in covs:
+                                if c and hasattr(c, "glyphs"):
+                                    glyphs.update(c.glyphs)
+                    if hasattr(subtable, "mapping"):
+                        for k, v in subtable.mapping.items():
+                            glyphs.add(k)
+                            if isinstance(v, list):
+                                glyphs.update(v)
+                            else:
+                                glyphs.add(v)
+                    if hasattr(subtable, "alternates"):
+                        for k, v in subtable.alternates.items():
+                            glyphs.add(k)
+                            glyphs.update(v)
+                    if hasattr(subtable, "ligatures"):
+                        for glyph, ligs in subtable.ligatures.items():
+                            glyphs.add(glyph)
+                            for lig in ligs:
+                                glyphs.update(lig.Component)
+                                glyphs.add(lig.LigGlyph)
+            except Exception:
+                pass
+    return glyphs
+
+
+def _remap_coverage(cov, rename_map):
+    """Remap glyph names in a Coverage object or list of Coverage objects."""
+    if cov is None:
+        return
+    if isinstance(cov, list):
+        for c in cov:
+            _remap_coverage(c, rename_map)
+    elif hasattr(cov, "glyphs"):
+        cov.glyphs = [rename_map.get(g, g) for g in cov.glyphs]
+
+
+def _remap_glyph_names_in_lookup(lookup, rename_map):
+    """Remap glyph names in a GSUB/GPOS lookup according to rename_map."""
+    for subtable in lookup.SubTable:
+        # All coverage-type attributes
+        for attr in ("Coverage", "BacktrackCoverage", "LookAheadCoverage",
+                     "InputCoverage", "BaseCoverage", "MarkCoverage", "LigatureCoverage"):
+            _remap_coverage(getattr(subtable, attr, None), rename_map)
+        # Substitution mappings (SingleSubst, MultipleSubst, etc.)
+        if hasattr(subtable, "mapping"):
+            new_mapping = {}
+            for k, v in subtable.mapping.items():
+                new_k = rename_map.get(k, k)
+                if isinstance(v, list):
+                    new_v = [rename_map.get(g, g) for g in v]
+                else:
+                    new_v = rename_map.get(v, v)
+                new_mapping[new_k] = new_v
+            subtable.mapping = new_mapping
+        # Alternates (AlternateSubst)
+        if hasattr(subtable, "alternates"):
+            subtable.alternates = {
+                rename_map.get(k, k): [rename_map.get(g, g) for g in v]
+                for k, v in subtable.alternates.items()
+            }
+        # Ligature substitution
+        if hasattr(subtable, "ligatures"):
+            new_ligs = {}
+            for glyph, lig_list in subtable.ligatures.items():
+                new_key = rename_map.get(glyph, glyph)
+                for lig in lig_list:
+                    lig.Component = [rename_map.get(g, g) for g in lig.Component]
+                    lig.LigGlyph = rename_map.get(lig.LigGlyph, lig.LigGlyph)
+                new_ligs[new_key] = lig_list
+            subtable.ligatures = new_ligs
+        # PairPos (GPOS)
+        if hasattr(subtable, "PairSet"):
+            pass  # PairSet uses Coverage for first glyph, already handled
+
+
 def _lookup_references_missing_glyphs(lookup, glyph_order_set):
-    """Check if a GSUB lookup references glyphs not in the target font."""
+    """Check if a GSUB/GPOS lookup references glyphs not in the target font."""
     try:
         for subtable in lookup.SubTable:
-            # Check Coverage tables for missing glyphs
-            if hasattr(subtable, "Coverage") and subtable.Coverage:
-                for glyph in subtable.Coverage.glyphs:
+            # All Coverage-based attributes
+            for attr in ("Coverage", "BaseCoverage", "MarkCoverage", "LigatureCoverage",
+                         "BacktrackCoverage", "LookAheadCoverage", "InputCoverage"):
+                cov = getattr(subtable, attr, None)
+                if cov is None:
+                    continue
+                # Can be a single Coverage or a list of Coverages
+                covs = cov if isinstance(cov, list) else [cov]
+                for c in covs:
+                    if c and hasattr(c, "glyphs"):
+                        for glyph in c.glyphs:
+                            if glyph not in glyph_order_set:
+                                return True
+            # Substitution mappings
+            if hasattr(subtable, "mapping"):
+                for k, v in subtable.mapping.items():
+                    if k not in glyph_order_set:
+                        return True
+                    if isinstance(v, list):
+                        for g in v:
+                            if g not in glyph_order_set:
+                                return True
+                    elif v not in glyph_order_set:
+                        return True
+            # Alternates
+            if hasattr(subtable, "alternates"):
+                for k, v in subtable.alternates.items():
+                    if k not in glyph_order_set:
+                        return True
+                    for g in v:
+                        if g not in glyph_order_set:
+                            return True
+            # Ligatures
+            if hasattr(subtable, "ligatures"):
+                for glyph, ligs in subtable.ligatures.items():
                     if glyph not in glyph_order_set:
                         return True
-            # Check substitution mappings
-            if hasattr(subtable, "mapping"):
-                for g in list(subtable.mapping.keys()) + list(subtable.mapping.values()):
-                    if g not in glyph_order_set:
-                        return True
+                    for lig in ligs:
+                        for g in lig.Component:
+                            if g not in glyph_order_set:
+                                return True
+                        if lig.LigGlyph not in glyph_order_set:
+                            return True
     except Exception:
         return True
     return False
 
 
-def _merge_gsub(target_font, donor_font):
-    """Merge GSUB features from a donor font.
+def _filter_and_remap_lookups(donor_table, target_go_set, rename_map):
+    """Deep-copy donor lookups, remap glyph names, filter out invalid ones.
 
-    Only copies lookups whose glyphs all exist in the target font,
-    preventing KeyError crashes during font compilation.
+    Returns (valid_lookups, lookup_index_map).
     """
-    target_gsub = target_font["GSUB"].table
-    donor_gsub = donor_font["GSUB"].table
-    target_go_set = set(target_font.getGlyphOrder())
-    existing_count = len(target_gsub.LookupList.Lookup)
+    valid_lookups = []
     lookup_map = {}
-
-    for i, lookup in enumerate(donor_gsub.LookupList.Lookup):
-        # Skip lookups that reference glyphs missing from target
-        if _lookup_references_missing_glyphs(lookup, target_go_set):
-            continue
+    for i, lookup in enumerate(donor_table.LookupList.Lookup):
         new_lookup = copy.deepcopy(lookup)
-        new_idx = existing_count + len(lookup_map)
-        target_gsub.LookupList.Lookup.append(new_lookup)
-        lookup_map[i] = new_idx
+        _remap_glyph_names_in_lookup(new_lookup, rename_map)
+        if _lookup_references_missing_glyphs(new_lookup, target_go_set):
+            continue
+        lookup_map[i] = len(valid_lookups)
+        valid_lookups.append(new_lookup)
+    return valid_lookups, lookup_map
 
+
+def _remap_features(donor_table, lookup_map):
+    """Deep-copy and remap feature records. Returns (features, feature_map)."""
+    features = []
     feature_map = {}
-    for i, fr in enumerate(donor_gsub.FeatureList.FeatureRecord):
+    for i, fr in enumerate(donor_table.FeatureList.FeatureRecord):
         new_fr = copy.deepcopy(fr)
-        new_fr.Feature.LookupListIndex = [lookup_map[li] for li in fr.Feature.LookupListIndex if li in lookup_map]
+        new_fr.Feature.LookupListIndex = [
+            lookup_map[li] for li in fr.Feature.LookupListIndex if li in lookup_map
+        ]
         if new_fr.Feature.LookupListIndex:
-            new_idx = len(target_gsub.FeatureList.FeatureRecord)
-            target_gsub.FeatureList.FeatureRecord.append(new_fr)
-            feature_map[i] = new_idx
+            feature_map[i] = len(features)
+            features.append(new_fr)
+    return features, feature_map
 
-    for sr in donor_gsub.ScriptList.ScriptRecord:
+
+def _remap_scripts(donor_table, feature_map):
+    """Deep-copy and remap script records."""
+    scripts = []
+    for sr in donor_table.ScriptList.ScriptRecord:
         new_script = copy.deepcopy(sr)
         if new_script.Script.DefaultLangSys:
             new_script.Script.DefaultLangSys.FeatureIndex = [
                 feature_map[fi] for fi in new_script.Script.DefaultLangSys.FeatureIndex if fi in feature_map
             ]
-        for lang_sys_record in getattr(new_script.Script, "LangSysRecord", []):
-            lang_sys_record.LangSys.FeatureIndex = [
-                feature_map[fi] for fi in lang_sys_record.LangSys.FeatureIndex if fi in feature_map
+        for lsr in getattr(new_script.Script, "LangSysRecord", []):
+            lsr.LangSys.FeatureIndex = [
+                feature_map[fi] for fi in lsr.LangSys.FeatureIndex if fi in feature_map
             ]
-        target_gsub.ScriptList.ScriptRecord.append(new_script)
+        scripts.append(new_script)
+    return scripts
+
+
+def _create_gsub_from_donor(target_font, donor_font, rename_map):
+    """Create a GSUB table in target from donor when target has none."""
+    from fontTools.ttLib.tables import otTables
+    donor_gsub = donor_font["GSUB"].table
+    target_go_set = set(target_font.getGlyphOrder())
+
+    lookups, lookup_map = _filter_and_remap_lookups(donor_gsub, target_go_set, rename_map)
+    if not lookups:
+        return
+    features, feature_map = _remap_features(donor_gsub, lookup_map)
+    scripts = _remap_scripts(donor_gsub, feature_map)
+
+    new_gsub = copy.deepcopy(donor_gsub)
+    new_gsub.LookupList.Lookup = lookups
+    new_gsub.LookupList.LookupCount = len(lookups)
+    new_gsub.FeatureList.FeatureRecord = features
+    new_gsub.FeatureList.FeatureCount = len(features)
+    new_gsub.ScriptList.ScriptRecord = scripts
+    new_gsub.ScriptList.ScriptCount = len(scripts)
+
+    from fontTools.ttLib import newTable
+    gsub_table = newTable("GSUB")
+    gsub_table.table = new_gsub
+    target_font["GSUB"] = gsub_table
+    logger.info("Created GSUB table with %d lookups from donor", len(lookups))
+
+
+def _create_gdef_from_donor(target_font, donor_font, rename_map):
+    """Create a GDEF table in target from donor when target has none."""
+    donor_gdef = donor_font["GDEF"].table
+    target_go_set = set(target_font.getGlyphOrder())
+
+    new_gdef = copy.deepcopy(donor_gdef)
+    if new_gdef.GlyphClassDef:
+        new_defs = {}
+        for glyph, cls in new_gdef.GlyphClassDef.classDefs.items():
+            mapped = rename_map.get(glyph, glyph)
+            if mapped in target_go_set:
+                new_defs[mapped] = cls
+        new_gdef.GlyphClassDef.classDefs = new_defs
+
+    from fontTools.ttLib import newTable
+    gdef_table = newTable("GDEF")
+    gdef_table.table = new_gdef
+    target_font["GDEF"] = gdef_table
+    logger.info("Created GDEF table from donor")
+
+
+def _create_gpos_from_donor(target_font, donor_font, rename_map):
+    """Create a GPOS table in target from donor when target has none."""
+    donor_gpos = donor_font["GPOS"].table
+    target_go_set = set(target_font.getGlyphOrder())
+
+    lookups, lookup_map = _filter_and_remap_lookups(donor_gpos, target_go_set, rename_map)
+    if not lookups:
+        return
+    features, feature_map = _remap_features(donor_gpos, lookup_map)
+    scripts = _remap_scripts(donor_gpos, feature_map)
+
+    new_gpos = copy.deepcopy(donor_gpos)
+    new_gpos.LookupList.Lookup = lookups
+    new_gpos.LookupList.LookupCount = len(lookups)
+    new_gpos.FeatureList.FeatureRecord = features
+    new_gpos.FeatureList.FeatureCount = len(features)
+    new_gpos.ScriptList.ScriptRecord = scripts
+    new_gpos.ScriptList.ScriptCount = len(scripts)
+
+    from fontTools.ttLib import newTable
+    gpos_table = newTable("GPOS")
+    gpos_table.table = new_gpos
+    target_font["GPOS"] = gpos_table
+    logger.info("Created GPOS table with %d lookups from donor", len(lookups))
+
+
+def _merge_gsub(target_font, donor_font, rename_map=None):
+    """Merge GSUB features from a donor font.
+
+    Remaps glyph names per rename_map, then copies lookups whose glyphs
+    all exist in the target font.
+    """
+    if rename_map is None:
+        rename_map = {}
+    target_gsub = target_font["GSUB"].table
+    donor_gsub = donor_font["GSUB"].table
+    target_go_set = set(target_font.getGlyphOrder())
+    existing_count = len(target_gsub.LookupList.Lookup)
+
+    lookups, raw_map = _filter_and_remap_lookups(donor_gsub, target_go_set, rename_map)
+    lookup_map = {k: v + existing_count for k, v in raw_map.items()}
+    target_gsub.LookupList.Lookup.extend(lookups)
+
+    existing_features = len(target_gsub.FeatureList.FeatureRecord)
+    features, raw_fmap = _remap_features(donor_gsub, lookup_map)
+    feature_map = {k: v + existing_features for k, v in raw_fmap.items()}
+    target_gsub.FeatureList.FeatureRecord.extend(features)
+
+    scripts = _remap_scripts(donor_gsub, feature_map)
+    target_gsub.ScriptList.ScriptRecord.extend(scripts)
 
     target_gsub.LookupList.LookupCount = len(target_gsub.LookupList.Lookup)
     target_gsub.FeatureList.FeatureCount = len(target_gsub.FeatureList.FeatureRecord)
     target_gsub.ScriptList.ScriptCount = len(target_gsub.ScriptList.ScriptRecord)
 
 
-def _merge_gdef(target_font, donor_font):
+def _merge_gdef(target_font, donor_font, rename_map=None):
     """Merge glyph class definitions from a donor font."""
+    if rename_map is None:
+        rename_map = {}
     target_gdef = target_font["GDEF"].table
     donor_gdef = donor_font["GDEF"].table
-    target_go = target_font.getGlyphOrder()
+    target_go_set = set(target_font.getGlyphOrder())
     if donor_gdef.GlyphClassDef and target_gdef.GlyphClassDef:
         for glyph, cls in donor_gdef.GlyphClassDef.classDefs.items():
-            if glyph in target_go and glyph not in target_gdef.GlyphClassDef.classDefs:
-                target_gdef.GlyphClassDef.classDefs[glyph] = cls
+            mapped = rename_map.get(glyph, glyph)
+            if mapped in target_go_set and mapped not in target_gdef.GlyphClassDef.classDefs:
+                target_gdef.GlyphClassDef.classDefs[mapped] = cls
 
 
-def _merge_gpos(target_font, donor_font):
+def _merge_gpos(target_font, donor_font, rename_map=None):
     """Merge GPOS features from a donor font.
 
-    Skips lookups that reference glyphs missing from the target font.
+    Remaps glyph names and skips lookups referencing missing glyphs.
     """
+    if rename_map is None:
+        rename_map = {}
     target_gpos = target_font["GPOS"].table
     donor_gpos = donor_font["GPOS"].table
     target_go_set = set(target_font.getGlyphOrder())
     existing_count = len(target_gpos.LookupList.Lookup)
-    lookup_map = {}
-    for i, lookup in enumerate(donor_gpos.LookupList.Lookup):
-        if _lookup_references_missing_glyphs(lookup, target_go_set):
-            continue
-        target_gpos.LookupList.Lookup.append(copy.deepcopy(lookup))
-        lookup_map[i] = existing_count + len(lookup_map)
 
-    feature_map = {}
-    for i, fr in enumerate(donor_gpos.FeatureList.FeatureRecord):
-        new_fr = copy.deepcopy(fr)
-        new_fr.Feature.LookupListIndex = [lookup_map[li] for li in fr.Feature.LookupListIndex if li in lookup_map]
-        if new_fr.Feature.LookupListIndex:
-            new_idx = len(target_gpos.FeatureList.FeatureRecord)
-            target_gpos.FeatureList.FeatureRecord.append(new_fr)
-            feature_map[i] = new_idx
+    lookups, raw_map = _filter_and_remap_lookups(donor_gpos, target_go_set, rename_map)
+    lookup_map = {k: v + existing_count for k, v in raw_map.items()}
+    target_gpos.LookupList.Lookup.extend(lookups)
 
-    for sr in donor_gpos.ScriptList.ScriptRecord:
-        new_script = copy.deepcopy(sr)
-        if new_script.Script.DefaultLangSys:
-            new_script.Script.DefaultLangSys.FeatureIndex = [
-                feature_map[fi] for fi in new_script.Script.DefaultLangSys.FeatureIndex if fi in feature_map
-            ]
-        for lang_sys_record in getattr(new_script.Script, "LangSysRecord", []):
-            lang_sys_record.LangSys.FeatureIndex = [
-                feature_map[fi] for fi in lang_sys_record.LangSys.FeatureIndex if fi in feature_map
-            ]
-        target_gpos.ScriptList.ScriptRecord.append(new_script)
+    existing_features = len(target_gpos.FeatureList.FeatureRecord)
+    features, raw_fmap = _remap_features(donor_gpos, lookup_map)
+    feature_map = {k: v + existing_features for k, v in raw_fmap.items()}
+    target_gpos.FeatureList.FeatureRecord.extend(features)
+
+    scripts = _remap_scripts(donor_gpos, feature_map)
+    target_gpos.ScriptList.ScriptRecord.extend(scripts)
 
     target_gpos.LookupList.LookupCount = len(target_gpos.LookupList.Lookup)
     target_gpos.FeatureList.FeatureCount = len(target_gpos.FeatureList.FeatureRecord)

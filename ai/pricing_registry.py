@@ -132,6 +132,10 @@ _REGISTRY: dict[str, dict[str, _PricingRow]] = {
     "deepseek":   _DEEPSEEK,
     "mistral":    _MISTRAL,
     "cohere":     _COHERE,
+    "deepl":      {
+        "deepl":      (25.00, 0.00),   # $25/1M chars input, output is the translation
+        "deepl-next": (25.00, 0.00),
+    },
 }
 
 

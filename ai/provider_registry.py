@@ -16,6 +16,7 @@ from ai.provider_vllm import VllmProvider
 from ai.provider_mistral import MistralProvider
 from ai.provider_cohere import CohereProvider
 from ai.provider_custom import CustomProvider
+from ai.provider_deepl import DeepLProvider
 from utils.logger import get_logger
 
 logger = get_logger("ai.registry")
@@ -30,6 +31,7 @@ PROVIDER_CLASSES: dict[str, type] = {
     "mistral": MistralProvider,
     "cohere": CohereProvider,
     "custom": CustomProvider,
+    "deepl": DeepLProvider,
 }
 
 

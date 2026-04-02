@@ -583,7 +583,89 @@ class ExplorerTab(QWidget):
                     patch_act = menu.addAction("Import OBJ + Patch to Game")
                     patch_act.triggered.connect(lambda _=False, e=entry: self._import_and_patch_mesh(e))
 
+        # Audio export/import for audio files
+        if click_index.isValid():
+            click_row_data = self._model.row_at(click_index.row())
+            if click_row_data:
+                audio_exts = {".wem", ".bnk", ".wav", ".ogg", ".mp3", ".pasound"}
+                file_ext = os.path.splitext(click_row_data.entry.path.lower())[1]
+                if file_ext in audio_exts:
+                    menu.addSeparator()
+                    entry = click_row_data.entry
+                    exp_wav = menu.addAction("Export as WAV")
+                    exp_wav.triggered.connect(lambda _=False, e=entry: self._export_audio_wav(e))
+                    imp_wav = menu.addAction("Import WAV + Patch to Game")
+                    imp_wav.triggered.connect(lambda _=False, e=entry: self._import_audio_patch(e))
+
         menu.exec(self._view.viewport().mapToGlobal(pos))
+
+    def _export_audio_wav(self, entry: PamtFileEntry):
+        """Export an audio file as WAV."""
+        try:
+            from core.audio_converter import wem_to_wav
+            data = self._vfs.read_entry_data(entry)
+            basename = os.path.splitext(os.path.basename(entry.path))[0]
+            temp = os.path.join(self._temp_dir, os.path.basename(entry.path))
+            with open(temp, "wb") as f:
+                f.write(data)
+
+            save_path = pick_save_file(self, "Export as WAV", f"{basename}.wav",
+                                       filters="WAV Files (*.wav)")
+            if not save_path:
+                return
+
+            ext = os.path.splitext(entry.path)[1].lower()
+            if ext in (".wem", ".bnk"):
+                result = wem_to_wav(temp, save_path)
+                if not result:
+                    show_error(self, "Export Error", "WEM to WAV conversion failed")
+                    return
+            else:
+                import shutil
+                shutil.copy2(temp, save_path)
+
+            self._progress.set_status(f"Exported WAV: {save_path}")
+            show_info(self, "Export Complete", f"Exported to:\n{save_path}")
+        except Exception as e:
+            show_error(self, "Export Error", str(e))
+
+    def _import_audio_patch(self, entry: PamtFileEntry):
+        """Import a WAV and patch to game."""
+        wav_path = pick_file(self, "Select WAV File",
+                             filters="Audio Files (*.wav *.ogg *.mp3);;All Files (*.*)")
+        if not wav_path:
+            return
+        try:
+            from core.audio_importer import import_audio
+            original_data = self._vfs.read_entry_data(entry)
+            new_data = import_audio(wav_path, entry, original_data)
+
+            if not confirm_action(self, "Patch Audio",
+                                  f"Replace {entry.path}?\n\n"
+                                  f"Original: {format_file_size(len(original_data))}\n"
+                                  f"New: {format_file_size(len(new_data))}"):
+                return
+
+            from core.repack_engine import RepackEngine, ModifiedFile
+            game_path = os.path.dirname(os.path.dirname(entry.paz_file))
+            papgt_path = os.path.join(game_path, "meta", "0.papgt")
+            paz_dir = os.path.basename(os.path.dirname(entry.paz_file))
+            pamt_data = self._vfs.load_pamt(paz_dir)
+
+            mod_file = ModifiedFile(
+                data=new_data, entry=entry,
+                pamt_data=pamt_data, package_group=paz_dir,
+            )
+            engine = RepackEngine(game_path)
+            result = engine.repack([mod_file], papgt_path=papgt_path)
+
+            if result.success:
+                self._progress.set_status(f"Audio patched: {entry.path}")
+                show_info(self, "Patch Complete", f"Patched {entry.path}")
+            else:
+                show_error(self, "Patch Error", f"Failed: {result.error}")
+        except Exception as e:
+            show_error(self, "Patch Error", str(e))
 
     def _on_archive_row_changed(self, current: QModelIndex, _previous: QModelIndex):
         """Preview when arrow keys change the current row."""
