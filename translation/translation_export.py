@@ -1,6 +1,7 @@
 """Export translations to paloc format for repacking."""
 
 import os
+from typing import Optional
 
 from core.paloc_parser import PalocEntry, PalocData, build_paloc
 from translation.translation_project import TranslationProject
