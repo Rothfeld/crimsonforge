@@ -157,12 +157,28 @@ class PreviewPane(QWidget):
         if _QWebEngineView is not None:
             self._web_view = _QWebEngineView()
             self._stack.addWidget(self._web_view)
+        else:
+            self._web_placeholder = QLabel("Web preview unavailable in this build")
+            self._web_placeholder.setAlignment(Qt.AlignCenter)
+            self._web_placeholder.setWordWrap(True)
+            self._web_placeholder.setStyleSheet("font-size: 13px; padding: 16px; color: #6c7086;")
+            self._stack.addWidget(self._web_placeholder)
 
         # IDX_MESH = 8
-        from ui.widgets.mesh_viewer import MeshViewer
-        self._mesh_viewer = MeshViewer()
-        logger.info("Mesh preview backend: %s", type(self._mesh_viewer).__name__)
-        self._stack.addWidget(self._mesh_viewer)
+        self._mesh_viewer = None
+        self._mesh_placeholder = None
+        try:
+            from ui.widgets.mesh_viewer import MeshViewer
+            self._mesh_viewer = MeshViewer()
+            logger.info("Mesh preview backend: %s", type(self._mesh_viewer).__name__)
+            self._stack.addWidget(self._mesh_viewer)
+        except Exception as exc:
+            logger.exception("Mesh preview backend unavailable: %s", exc)
+            self._mesh_placeholder = QLabel("Interactive mesh preview unavailable in this build")
+            self._mesh_placeholder.setAlignment(Qt.AlignCenter)
+            self._mesh_placeholder.setWordWrap(True)
+            self._mesh_placeholder.setStyleSheet("font-size: 13px; padding: 16px; color: #f9e2af;")
+            self._stack.addWidget(self._mesh_placeholder)
 
         self._stack.setCurrentIndex(IDX_EMPTY)
 
@@ -339,7 +355,7 @@ class PreviewPane(QWidget):
                 data = f.read()
             preview_mesh = build_preview_mesh(data, os.path.basename(path))
 
-            if preview_mesh.vertices and preview_mesh.faces:
+            if self._mesh_viewer is not None and preview_mesh.vertices and preview_mesh.faces:
                 info_text = (
                     f"{preview_mesh.total_vertices:,} verts | {preview_mesh.total_faces:,} faces | "
                     f"{preview_mesh.submesh_count} submesh(es)"
