@@ -888,6 +888,180 @@ def _pack_static_vertex_record(
     return rec
 
 
+def _static_alignment_match_cost(
+    orig_vertex: tuple[float, float, float],
+    new_vertex: tuple[float, float, float],
+    orig_idx: int,
+    new_idx: int,
+    diag: float,
+    max_count: int,
+) -> float:
+    """Score how likely an imported static vertex maps to an original slot."""
+    dist = math.dist(orig_vertex, new_vertex)
+    if orig_idx == new_idx:
+        dist *= 0.75
+    elif abs(orig_idx - new_idx) <= 2:
+        dist *= 0.85
+
+    order_penalty = (
+        abs(orig_idx - new_idx) / max(max_count, 1)
+    ) * max(diag * 0.05, 0.01)
+    return dist + order_penalty
+
+
+def _align_static_vertex_sequences(
+    orig_vertices: list[tuple[float, float, float]],
+    new_vertices: list[tuple[float, float, float]],
+) -> list[int]:
+    """Align original/new static vertex order while allowing inserted vertices."""
+    orig_count = len(orig_vertices)
+    new_count = len(new_vertices)
+    aligned = [-1] * new_count
+    if orig_count == 0 or new_count == 0:
+        return aligned
+
+    bbox_min, bbox_max = _compute_bbox(orig_vertices)
+    diag = math.dist(bbox_min, bbox_max)
+    gap_penalty = max(diag * 0.02, 0.01)
+    band = max(128, abs(orig_count - new_count) + 128)
+    max_states = (orig_count + 1) * min(new_count + 1, band * 2 + 1)
+    if max_states > 3_000_000:
+        raise ValueError(
+            f"Static vertex alignment too large ({orig_count}x{new_count}, band={band})"
+        )
+
+    prev_row = {j: j * gap_penalty for j in range(0, min(new_count, band) + 1)}
+    backtrack: dict[tuple[int, int], str] = {}
+    for j in range(1, min(new_count, band) + 1):
+        backtrack[(0, j)] = "left"
+
+    max_count = max(orig_count, new_count)
+    for i in range(1, orig_count + 1):
+        j_start = max(0, i - band)
+        j_end = min(new_count, i + band)
+        curr_row: dict[int, float] = {}
+        if j_start == 0:
+            curr_row[0] = i * gap_penalty
+            backtrack[(i, 0)] = "up"
+
+        for j in range(max(1, j_start), j_end + 1):
+            best_cost = float("inf")
+            best_move = ""
+
+            diag_prev = prev_row.get(j - 1)
+            if diag_prev is not None:
+                cost = diag_prev + _static_alignment_match_cost(
+                    orig_vertices[i - 1],
+                    new_vertices[j - 1],
+                    i - 1,
+                    j - 1,
+                    diag,
+                    max_count,
+                )
+                if cost < best_cost:
+                    best_cost = cost
+                    best_move = "diag"
+
+            up_prev = prev_row.get(j)
+            if up_prev is not None:
+                cost = up_prev + gap_penalty
+                if cost < best_cost:
+                    best_cost = cost
+                    best_move = "up"
+
+            left_prev = curr_row.get(j - 1)
+            if left_prev is not None:
+                cost = left_prev + gap_penalty
+                if cost < best_cost:
+                    best_cost = cost
+                    best_move = "left"
+
+            if best_move:
+                curr_row[j] = best_cost
+                backtrack[(i, j)] = best_move
+
+        prev_row = curr_row
+
+    if new_count not in prev_row:
+        raise ValueError("Static vertex alignment band did not reach the final state")
+
+    i = orig_count
+    j = new_count
+    while i > 0 or j > 0:
+        move = backtrack.get((i, j))
+        if move == "diag":
+            aligned[j - 1] = i - 1
+            i -= 1
+            j -= 1
+        elif move == "left":
+            j -= 1
+        elif move == "up":
+            i -= 1
+        else:
+            # Recover gracefully if a rare boundary state is missing.
+            if j > 0 and i > 0:
+                aligned[j - 1] = i - 1
+                i -= 1
+                j -= 1
+            elif j > 0:
+                j -= 1
+            else:
+                i -= 1
+
+    return aligned
+
+
+def _choose_static_donor_indices(orig_sm: SubMesh, new_sm: SubMesh) -> list[int]:
+    """Choose donor records for a topology-changing static mesh rebuild."""
+    orig_vertices = list(orig_sm.vertices)
+    new_vertices = list(new_sm.vertices)
+    if not new_vertices:
+        return []
+    if not orig_vertices:
+        return [0] * len(new_vertices)
+
+    try:
+        donor_indices = _align_static_vertex_sequences(orig_vertices, new_vertices)
+    except Exception as exc:
+        logger.debug(
+            "Static donor alignment fallback for %s: %s",
+            getattr(new_sm, "name", "") or getattr(orig_sm, "name", "") or "<submesh>",
+            exc,
+        )
+        donor_indices = [-1] * len(new_vertices)
+
+    rounded_map: dict[tuple[int, int, int], list[int]] = {}
+    for orig_idx, vertex in enumerate(orig_vertices):
+        key = (
+            round(vertex[0] * 100000),
+            round(vertex[1] * 100000),
+            round(vertex[2] * 100000),
+        )
+        rounded_map.setdefault(key, []).append(orig_idx)
+
+    cell_size, grid = _build_spatial_hash(orig_vertices)
+    for new_idx, vertex in enumerate(new_vertices):
+        if 0 <= donor_indices[new_idx] < len(orig_vertices):
+            continue
+
+        key = (
+            round(vertex[0] * 100000),
+            round(vertex[1] * 100000),
+            round(vertex[2] * 100000),
+        )
+        exact_hits = rounded_map.get(key)
+        if exact_hits:
+            donor_indices[new_idx] = min(
+                exact_hits,
+                key=lambda orig_idx: abs(orig_idx - new_idx),
+            )
+            continue
+
+        donor_indices[new_idx] = _nearest_point_index(vertex, orig_vertices, cell_size, grid)
+
+    return donor_indices
+
+
 def _replace_all_in_region(
     data: bytearray,
     start: int,
@@ -1072,7 +1246,7 @@ def _serialize_pam_combined_layout(
     vert_cursor = 0
     idx_cursor = 0
 
-    for sm_idx, (sm, entry) in enumerate(zip(mesh.submeshes, entries)):
+    for sm_idx, (sm, orig_sm, entry) in enumerate(zip(mesh.submeshes, original_mesh.submeshes, entries)):
         struct.pack_into("<I", result, entry["desc_off"], len(sm.vertices))
         struct.pack_into("<I", result, entry["desc_off"] + 4, len(sm.faces) * 3)
         struct.pack_into("<I", result, entry["desc_off"] + 8, vert_cursor)
@@ -1081,9 +1255,11 @@ def _serialize_pam_combined_layout(
         orig_vert_base = geom_off + entry["ve"] * stride
         orig_nv = entry["nv"]
         uv_data = sm.uvs if len(sm.uvs) == len(sm.vertices) else []
+        donor_indices = _choose_static_donor_indices(orig_sm, sm)
 
         for vi, vertex in enumerate(sm.vertices):
-            rec = _make_vertex_template_record(original_data, orig_vert_base, stride, vi, orig_nv)
+            donor_idx = donor_indices[vi] if vi < len(donor_indices) else vi
+            rec = _make_vertex_template_record(original_data, orig_vert_base, stride, donor_idx, orig_nv)
             uv = uv_data[vi] if uv_data else None
             geom_data.extend(_pack_static_vertex_record(rec, stride, vertex, uv, bmin, bmax))
 
@@ -1133,7 +1309,7 @@ def _serialize_pam_scan_combined_layout(
     vert_cursor = 0
     idx_cursor = 0
 
-    for sm, entry in zip(mesh.submeshes, entries):
+    for sm, orig_sm, entry in zip(mesh.submeshes, original_mesh.submeshes, entries):
         struct.pack_into("<I", result, entry["desc_off"], len(sm.vertices))
         struct.pack_into("<I", result, entry["desc_off"] + 4, len(sm.faces) * 3)
         struct.pack_into("<I", result, entry["desc_off"] + 8, vert_cursor)
@@ -1142,9 +1318,11 @@ def _serialize_pam_scan_combined_layout(
         orig_vert_base = scan_start + entry["ve"] * stride
         orig_nv = entry["nv"]
         uv_data = sm.uvs if len(sm.uvs) == len(sm.vertices) else []
+        donor_indices = _choose_static_donor_indices(orig_sm, sm)
 
         for vi, vertex in enumerate(sm.vertices):
-            rec = _make_vertex_template_record(original_data, orig_vert_base, stride, vi, orig_nv)
+            donor_idx = donor_indices[vi] if vi < len(donor_indices) else vi
+            rec = _make_vertex_template_record(original_data, orig_vert_base, stride, donor_idx, orig_nv)
             uv = uv_data[vi] if uv_data else None
             geom_data.extend(_pack_static_vertex_record(rec, stride, vertex, uv, bmin, bmax))
 
@@ -1196,7 +1374,7 @@ def _serialize_pam_backward_scan_combined_layout(
     vert_cursor = 0
     idx_cursor = 0
 
-    for sm, entry in zip(mesh.submeshes, entries):
+    for sm, orig_sm, entry in zip(mesh.submeshes, original_mesh.submeshes, entries):
         struct.pack_into("<I", result, entry["desc_off"], len(sm.vertices))
         struct.pack_into("<I", result, entry["desc_off"] + 4, len(sm.faces) * 3)
         struct.pack_into("<I", result, entry["desc_off"] + 8, vert_cursor)
@@ -1205,9 +1383,11 @@ def _serialize_pam_backward_scan_combined_layout(
         orig_vert_base = geom_off + entry["ve"] * stride
         orig_nv = entry["nv"]
         uv_data = sm.uvs if len(sm.uvs) == len(sm.vertices) else []
+        donor_indices = _choose_static_donor_indices(orig_sm, sm)
 
         for vi, vertex in enumerate(sm.vertices):
-            rec = _make_vertex_template_record(original_data, orig_vert_base, stride, vi, orig_nv)
+            donor_idx = donor_indices[vi] if vi < len(donor_indices) else vi
+            rec = _make_vertex_template_record(original_data, orig_vert_base, stride, donor_idx, orig_nv)
             uv = uv_data[vi] if uv_data else None
             geom_data.extend(_pack_static_vertex_record(rec, stride, vertex, uv, bmin, bmax))
 
@@ -1255,7 +1435,7 @@ def _serialize_pam_local_layout(
     geom_data = bytearray()
     current_voff = 0
 
-    for sm, entry in zip(mesh.submeshes, entries):
+    for sm, orig_sm, entry in zip(mesh.submeshes, original_mesh.submeshes, entries):
         stride = entry["stride"]
         struct.pack_into("<I", result, entry["desc_off"], len(sm.vertices))
         struct.pack_into("<I", result, entry["desc_off"] + 4, len(sm.faces) * 3)
@@ -1265,9 +1445,11 @@ def _serialize_pam_local_layout(
         orig_vert_base = geom_off + entry["ve"]
         orig_nv = entry["nv"]
         uv_data = sm.uvs if len(sm.uvs) == len(sm.vertices) else []
+        donor_indices = _choose_static_donor_indices(orig_sm, sm)
 
         for vi, vertex in enumerate(sm.vertices):
-            rec = _make_vertex_template_record(original_data, orig_vert_base, stride, vi, orig_nv)
+            donor_idx = donor_indices[vi] if vi < len(donor_indices) else vi
+            rec = _make_vertex_template_record(original_data, orig_vert_base, stride, donor_idx, orig_nv)
             uv = uv_data[vi] if uv_data else None
             geom_data.extend(_pack_static_vertex_record(rec, stride, vertex, uv, bmin, bmax))
 
