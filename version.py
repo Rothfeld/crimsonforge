@@ -17,11 +17,18 @@ VERSION BUMPING RULES
 __all__ = ["APP_VERSION", "APP_NAME", "CHANGELOG"]
 
 APP_NAME = "CrimsonForge"
-APP_VERSION = "1.16.0"
+APP_VERSION = "1.16.1"
 
 # Each entry: (version, date, list_of_changes)
 # Newest first. `date` is YYYY-MM-DD.
 CHANGELOG: list[tuple[str, str, list[str]]] = [
+    (
+        "1.16.1", "2026-04-08", [
+            "[Fix] Standalone Windows builds now bundle ffmpeg and vgmstream helper tools directly inside the packaged app so audio workflows run on clean machines without first-run downloads",
+            "[Fix] Bundled runtime now resolves packaged helper executables before user-space tool installs, making shipped builds more reliable on fresh systems",
+            "[Fix] Release packaging now includes the helper tool trees alongside core/pa_checksum.dll and the packaged data directory in a single self-contained executable",
+        ],
+    ),
     (
         "1.16.0", "2026-04-07", [
             "[Feature] Explorer Navigator added as a dedicated popup workbench with live Characters, Items, and Families views built directly from installed game data",

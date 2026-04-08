@@ -11,6 +11,7 @@ import tempfile
 import shutil
 from typing import Optional, Callable, Tuple
 
+from utils.app_paths import app_root
 from utils.logger import get_logger
 
 logger = get_logger("utils.ffmpeg_installer")
@@ -21,12 +22,14 @@ INSTALL_DIR = os.path.join(os.path.expanduser("~"), ".crimsonforge", "tools", "f
 
 def get_ffmpeg_path() -> str:
     """Get path to ffmpeg executable."""
-    # Check managed install first
+    bundled = app_root() / "tools" / "ffmpeg" / "ffmpeg.exe"
+    if bundled.is_file():
+        return str(bundled)
+
     managed = os.path.join(INSTALL_DIR, "ffmpeg.exe")
     if os.path.isfile(managed):
         return managed
 
-    # Check PATH
     path = shutil.which("ffmpeg")
     if path:
         return path

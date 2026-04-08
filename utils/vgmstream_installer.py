@@ -17,6 +17,7 @@ import platform
 import urllib.request
 import urllib.error
 
+from utils.app_paths import app_root
 from utils.logger import get_logger
 
 logger = get_logger("utils.vgmstream_installer")
@@ -35,9 +36,14 @@ def get_vgmstream_path() -> str:
     """Return path to vgmstream-cli if available, or empty string.
 
     Checks:
-    1. System PATH (user already installed it)
-    2. Our managed install at ~/.crimsonforge/tools/vgmstream/
+    1. Bundled runtime tools
+    2. System PATH (user already installed it)
+    3. Our managed install at ~/.crimsonforge/tools/vgmstream/
     """
+    bundled = app_root() / "tools" / "vgmstream" / "vgmstream-cli.exe"
+    if bundled.is_file():
+        return str(bundled)
+
     system_path = shutil.which("vgmstream-cli") or shutil.which("vgmstream123")
     if system_path:
         return system_path

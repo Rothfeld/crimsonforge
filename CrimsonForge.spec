@@ -6,6 +6,7 @@ import os
 
 block_cipher = None
 ROOT = SPECPATH
+USER_HOME = os.path.expanduser('~')
 
 
 def collect_project_data(relative_dir: str) -> list[tuple[str, str]]:
@@ -19,7 +20,21 @@ def collect_project_data(relative_dir: str) -> list[tuple[str, str]]:
     return results
 
 
+def collect_optional_tree(source_dir: str, target_dir: str) -> list[tuple[str, str]]:
+    results = []
+    if not os.path.isdir(source_dir):
+        return results
+    for current_root, _, filenames in os.walk(source_dir):
+        relative_root = os.path.relpath(current_root, source_dir)
+        dest_dir = target_dir if relative_root == '.' else os.path.join(target_dir, relative_root)
+        for filename in filenames:
+            results.append((os.path.join(current_root, filename), dest_dir))
+    return results
+
+
 DATA_FILES = collect_project_data("data")
+DATA_FILES += collect_optional_tree(os.path.join(USER_HOME, '.crimsonforge', 'tools', 'ffmpeg'), os.path.join('tools', 'ffmpeg'))
+DATA_FILES += collect_optional_tree(os.path.join(USER_HOME, '.crimsonforge', 'tools', 'vgmstream'), os.path.join('tools', 'vgmstream'))
 
 a = Analysis(
     [os.path.join(ROOT, 'main.py')],
