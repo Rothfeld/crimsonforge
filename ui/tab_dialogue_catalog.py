@@ -341,6 +341,7 @@ class DialogueCatalogTab(QWidget):
 
         self._story_tree = QTreeWidget()
         self._story_tree.setHeaderLabels(["Story / Chapter / Conversation / Scene", "Count"])
+        self._story_tree.setUniformRowHeights(True)
         self._story_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self._story_tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self._story_tree.itemSelectionChanged.connect(self._apply_filters)
@@ -348,6 +349,7 @@ class DialogueCatalogTab(QWidget):
 
         self._speaker_tree = QTreeWidget()
         self._speaker_tree.setHeaderLabels(["Speaker / Bucket", "Count"])
+        self._speaker_tree.setUniformRowHeights(True)
         self._speaker_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self._speaker_tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self._speaker_tree.itemSelectionChanged.connect(self._apply_filters)
@@ -355,6 +357,7 @@ class DialogueCatalogTab(QWidget):
 
         self._family_tree = QTreeWidget()
         self._family_tree.setHeaderLabels(["Category / Family", "Count"])
+        self._family_tree.setUniformRowHeights(True)
         self._family_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self._family_tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self._family_tree.itemSelectionChanged.connect(self._apply_filters)
@@ -384,6 +387,10 @@ class DialogueCatalogTab(QWidget):
         self._line_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self._line_table.setAlternatingRowColors(True)
         self._line_table.verticalHeader().setVisible(False)
+        self._line_table.verticalHeader().setMinimumSectionSize(22)
+        self._line_table.verticalHeader().setDefaultSectionSize(24)
+        self._line_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self._line_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self._line_table.horizontalHeader().setStretchLastSection(True)
         self._line_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self._line_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -505,10 +512,16 @@ class DialogueCatalogTab(QWidget):
         self._speaker_bucket_combo.blockSignals(False)
 
     def _populate_story_tree(self) -> None:
-        self._story_tree.clear()
-        if self._data is None:
-            return
+        self._story_tree.setUpdatesEnabled(False)
+        try:
+            self._story_tree.clear()
+            if self._data is None:
+                return
+            self.__populate_story_tree_inner()
+        finally:
+            self._story_tree.setUpdatesEnabled(True)
 
+    def __populate_story_tree_inner(self) -> None:
         root = QTreeWidgetItem(["All Story", str(len(self._data.records))])
         root.setData(0, Qt.UserRole, {"mode": "story"})
         self._story_tree.addTopLevelItem(root)
@@ -587,10 +600,16 @@ class DialogueCatalogTab(QWidget):
         self._story_tree.setCurrentItem(root)
 
     def _populate_speaker_tree(self) -> None:
-        self._speaker_tree.clear()
-        if self._data is None:
-            return
+        self._speaker_tree.setUpdatesEnabled(False)
+        try:
+            self._speaker_tree.clear()
+            if self._data is None:
+                return
+            self.__populate_speaker_tree_inner()
+        finally:
+            self._speaker_tree.setUpdatesEnabled(True)
 
+    def __populate_speaker_tree_inner(self) -> None:
         root = QTreeWidgetItem(["All Speakers", str(len(self._data.records))])
         root.setData(0, Qt.UserRole, {"mode": "speaker"})
         self._speaker_tree.addTopLevelItem(root)
@@ -617,10 +636,16 @@ class DialogueCatalogTab(QWidget):
         self._speaker_tree.setCurrentItem(root)
 
     def _populate_family_tree(self) -> None:
-        self._family_tree.clear()
-        if self._data is None:
-            return
+        self._family_tree.setUpdatesEnabled(False)
+        try:
+            self._family_tree.clear()
+            if self._data is None:
+                return
+            self.__populate_family_tree_inner()
+        finally:
+            self._family_tree.setUpdatesEnabled(True)
 
+    def __populate_family_tree_inner(self) -> None:
         root = QTreeWidgetItem(["All Dialogue", str(len(self._data.records))])
         root.setData(0, Qt.UserRole, {"mode": "family"})
         self._family_tree.addTopLevelItem(root)

@@ -68,6 +68,7 @@ class UnpackTab(QWidget):
 
         self._file_tree = QTreeWidget()
         self._file_tree.setHeaderLabels(["", "File", "Size", "Compressed", "Type"])
+        self._file_tree.setUniformRowHeights(True)
         self._file_tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
         self._file_tree.setAlternatingRowColors(True)
         self._file_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)

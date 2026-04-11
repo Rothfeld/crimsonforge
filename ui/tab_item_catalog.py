@@ -363,6 +363,7 @@ class ItemCatalogTab(QWidget):
         left_layout.addWidget(QLabel("Category Tree"))
         self._item_tree = QTreeWidget()
         self._item_tree.setHeaderLabels(["Branch", "Count"])
+        self._item_tree.setUniformRowHeights(True)
         self._item_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self._item_tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self._item_tree.itemSelectionChanged.connect(self._apply_filters)
@@ -384,6 +385,10 @@ class ItemCatalogTab(QWidget):
         self._item_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self._item_table.setAlternatingRowColors(True)
         self._item_table.verticalHeader().setVisible(False)
+        self._item_table.verticalHeader().setMinimumSectionSize(22)
+        self._item_table.verticalHeader().setDefaultSectionSize(24)
+        self._item_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self._item_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self._item_table.horizontalHeader().setStretchLastSection(True)
         self._item_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self._item_table.selectionModel().selectionChanged.connect(self._update_item_details)
@@ -416,6 +421,7 @@ class ItemCatalogTab(QWidget):
         left_layout.addWidget(QLabel("Raw Table Domains"))
         self._table_tree = QTreeWidget()
         self._table_tree.setHeaderLabels(["Branch", "Count"])
+        self._table_tree.setUniformRowHeights(True)
         self._table_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self._table_tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self._table_tree.itemSelectionChanged.connect(self._apply_filters)
@@ -437,6 +443,10 @@ class ItemCatalogTab(QWidget):
         self._table_view.setSelectionMode(QAbstractItemView.SingleSelection)
         self._table_view.setAlternatingRowColors(True)
         self._table_view.verticalHeader().setVisible(False)
+        self._table_view.verticalHeader().setMinimumSectionSize(22)
+        self._table_view.verticalHeader().setDefaultSectionSize(24)
+        self._table_view.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self._table_view.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self._table_view.horizontalHeader().setStretchLastSection(True)
         self._table_view.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self._table_view.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
@@ -524,10 +534,16 @@ class ItemCatalogTab(QWidget):
         self._populate_table_tree()
 
     def _populate_item_tree(self) -> None:
-        self._item_tree.clear()
-        if self._data is None:
-            return
+        self._item_tree.setUpdatesEnabled(False)
+        try:
+            self._item_tree.clear()
+            if self._data is None:
+                return
+            self.__populate_item_tree_inner()
+        finally:
+            self._item_tree.setUpdatesEnabled(True)
 
+    def __populate_item_tree_inner(self) -> None:
         root = QTreeWidgetItem(["All Items", str(len(self._data.items))])
         root.setData(0, Qt.UserRole, ())
         self._item_tree.addTopLevelItem(root)
@@ -577,10 +593,16 @@ class ItemCatalogTab(QWidget):
         self._item_tree.setCurrentItem(root)
 
     def _populate_table_tree(self) -> None:
-        self._table_tree.clear()
-        if self._data is None:
-            return
+        self._table_tree.setUpdatesEnabled(False)
+        try:
+            self._table_tree.clear()
+            if self._data is None:
+                return
+            self.__populate_table_tree_inner()
+        finally:
+            self._table_tree.setUpdatesEnabled(True)
 
+    def __populate_table_tree_inner(self) -> None:
         root = QTreeWidgetItem(["All Tables", str(len(self._data.tables))])
         root.setData(0, Qt.UserRole, ())
         self._table_tree.addTopLevelItem(root)

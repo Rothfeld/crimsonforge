@@ -729,6 +729,9 @@ class ExplorerWorkbench(QWidget):
         self._char_table.setSelectionMode(QTableView.SingleSelection)
         self._char_table.setAlternatingRowColors(True)
         self._char_table.verticalHeader().setVisible(False)
+        self._char_table.verticalHeader().setMinimumSectionSize(22)
+        self._char_table.verticalHeader().setDefaultSectionSize(24)
+        self._char_table.setVerticalScrollMode(QTableView.ScrollPerPixel)
         self._char_table.horizontalHeader().setStretchLastSection(True)
         self._char_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         for column in range(1, 8):
@@ -824,6 +827,9 @@ class ExplorerWorkbench(QWidget):
         self._item_table.setSelectionMode(QTableView.SingleSelection)
         self._item_table.setAlternatingRowColors(True)
         self._item_table.verticalHeader().setVisible(False)
+        self._item_table.verticalHeader().setMinimumSectionSize(22)
+        self._item_table.verticalHeader().setDefaultSectionSize(24)
+        self._item_table.setVerticalScrollMode(QTableView.ScrollPerPixel)
         self._item_table.horizontalHeader().setStretchLastSection(True)
         self._item_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         for column in range(1, 7):
@@ -913,6 +919,9 @@ class ExplorerWorkbench(QWidget):
         self._family_table.setSelectionMode(QTableView.SingleSelection)
         self._family_table.setAlternatingRowColors(True)
         self._family_table.verticalHeader().setVisible(False)
+        self._family_table.verticalHeader().setMinimumSectionSize(22)
+        self._family_table.verticalHeader().setDefaultSectionSize(24)
+        self._family_table.setVerticalScrollMode(QTableView.ScrollPerPixel)
         self._family_table.horizontalHeader().setStretchLastSection(True)
         for column in range(0, 6):
             mode = QHeaderView.Stretch if column == 0 else QHeaderView.ResizeToContents

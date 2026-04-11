@@ -58,6 +58,7 @@ class RepackTab(QWidget):
 
         self._file_tree = QTreeWidget()
         self._file_tree.setHeaderLabels(["", "File", "Size", "Target PAZ", "Status"])
+        self._file_tree.setUniformRowHeights(True)
         self._file_tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
         self._file_tree.setAlternatingRowColors(True)
         layout.addWidget(self._file_tree, 1)

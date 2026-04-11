@@ -191,6 +191,7 @@ def build_mesh_manager_package(
         "generator_url": "https://github.com/hzeemr/crimsonforge",
         "game_build": game_build,
         "include_paired_lod": include_paired_lod,
+        "asset_count": len(manifest_assets),
         "file_count": len(loose_files),
         "files_root": "files",
         "assets": [asdict(asset) for asset in manifest_assets],

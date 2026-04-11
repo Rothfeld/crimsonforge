@@ -8,9 +8,15 @@ or auto-discovers the game packages directory. After the game is loaded:
 - No tab requires the user to browse for game paths again
 
 Tabs: Game Setup | Explorer (Unpack+Browse+Edit) | Repack | Translate | Font Builder | Settings | About
+
+Performance architecture (v1.16.2):
+- Tabs are lazily instantiated: only constructed when first clicked.
+- Game loading runs in a background QThread — UI stays responsive.
+- PAMT scanning uses concurrent.futures for parallel I/O.
 """
 
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from PySide6.QtWidgets import (
     QMainWindow, QTabWidget, QStatusBar, QLabel, QApplication,
     QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
@@ -22,23 +28,38 @@ from utils.config import ConfigManager
 from utils.platform_utils import auto_discover_game
 from core.vfs_manager import VfsManager
 from ai.provider_registry import ProviderRegistry
-from ui.tab_explorer import ExplorerTab
-from ui.tab_dialogue_catalog import DialogueCatalogTab
-from ui.tab_item_catalog import ItemCatalogTab
-from ui.tab_repack import RepackTab
-from ui.tab_translate import TranslateTab
-from ui.tab_font import FontTab
-from ui.tab_settings import SettingsTab
-from ui.tab_audio import AudioTab
-from ui.tab_about import AboutTab
 from ui.themes.dark import DARK_THEME
 from ui.themes.light import LIGHT_THEME
 from ui.dialogs.confirmation import show_error
 from ui.dialogs.file_picker import pick_directory
+from utils.thread_worker import FunctionWorker
 from version import APP_VERSION, APP_NAME
 from utils.logger import get_logger
 
 logger = get_logger("ui.main_window")
+
+# ---------------------------------------------------------------------------
+# Tab registry — maps tab index to (module_path, class_name, tab_label,
+# constructor_args_key).  Tabs are only imported and constructed on demand.
+# ---------------------------------------------------------------------------
+_TAB_REGISTRY: list[dict] = [
+    # Index 0 — Setup tab is built inline, not lazy.
+    {"label": "Game Setup", "lazy": False},
+    {"label": "Explorer",          "module": "ui.tab_explorer",          "cls": "ExplorerTab",          "args": "config",    "lazy": True},
+    {"label": "Item Catalog",      "module": "ui.tab_item_catalog",      "cls": "ItemCatalogTab",       "args": None,        "lazy": True},
+    {"label": "Dialogue Catalog",  "module": "ui.tab_dialogue_catalog",  "cls": "DialogueCatalogTab",   "args": None,        "lazy": True},
+    {"label": "Repack",            "module": "ui.tab_repack",            "cls": "RepackTab",            "args": "config",    "lazy": True},
+    {"label": "Translate",         "module": "ui.tab_translate",         "cls": "TranslateTab",         "args": "config_registry", "lazy": True},
+    {"label": "Audio",             "module": "ui.tab_audio",             "cls": "AudioTab",             "args": "config",    "lazy": True},
+    {"label": "Font Builder",      "module": "ui.tab_font",             "cls": "FontTab",              "args": "config",    "lazy": True},
+    {"label": "Settings",          "module": "ui.tab_settings",          "cls": "SettingsTab",          "args": "config_registry", "lazy": True},
+    {"label": "About",             "module": "ui.tab_about",             "cls": "AboutTab",             "args": "config_kw", "lazy": True},
+]
+
+
+class _LazyPlaceholder(QWidget):
+    """Invisible stand-in added to the QTabWidget until the real tab is needed."""
+    pass
 
 
 class MainWindow(QMainWindow):
@@ -56,6 +77,12 @@ class MainWindow(QMainWindow):
         self._vfs: VfsManager = None
         self._packages_path = ""
         self._discovered_palocs: list[dict] = []
+        self._all_groups: list[str] = []
+        self._game_version = ""
+        self._loader_worker: FunctionWorker = None
+
+        # Lazy tab tracking: index → real widget (None until materialised)
+        self._real_tabs: dict[int, QWidget] = {}
 
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} - Crimson Desert Modding Studio")
         self.setMinimumSize(1100, 700)
@@ -68,31 +95,28 @@ class MainWindow(QMainWindow):
         self._central_stack.addWidget(self._loading_page)
         self.setCentralWidget(self._central_stack)
 
+        # --- Build tabs: Setup is eager, everything else is a placeholder ---
         self._setup_tab = self._build_setup_tab()
-        self._explorer_tab = ExplorerTab(config)
-        self._item_catalog_tab = ItemCatalogTab()
-        self._dialogue_catalog_tab = DialogueCatalogTab()
-        self._repack_tab = RepackTab(config)
-        self._translate_tab = TranslateTab(config, registry)
-        self._audio_tab = AudioTab(config)
-        self._font_tab = FontTab(config)
-        self._settings_tab = SettingsTab(config, registry)
-        self._about_tab = AboutTab(config=config)
-
         self._tabs.addTab(self._setup_tab, "Game Setup")
-        self._tabs.addTab(self._explorer_tab, "Explorer")
-        self._tabs.addTab(self._item_catalog_tab, "Item Catalog")
-        self._tabs.addTab(self._dialogue_catalog_tab, "Dialogue Catalog")
-        self._tabs.addTab(self._repack_tab, "Repack")
-        self._tabs.addTab(self._translate_tab, "Translate")
-        self._tabs.addTab(self._audio_tab, "Audio")
-        self._tabs.addTab(self._font_tab, "Font Builder")
-        self._tabs.addTab(self._settings_tab, "Settings")
-        self._tabs.addTab(self._about_tab, "About")
+        self._real_tabs[0] = self._setup_tab
 
-        self._explorer_tab.files_extracted.connect(self._on_files_extracted)
-        self._settings_tab.theme_changed.connect(self._apply_theme)
-        self._settings_tab.settings_changed.connect(self._on_settings_changed)
+        for i, entry in enumerate(_TAB_REGISTRY):
+            if i == 0:
+                continue  # already added Setup
+            placeholder = _LazyPlaceholder()
+            self._tabs.addTab(placeholder, entry["label"])
+
+        # Eagerly create Settings + About (lightweight, always needed)
+        self._materialise_tab(8)   # Settings
+        self._materialise_tab(9)   # About
+
+        # Connect signals after Settings tab exists
+        settings_tab = self._real_tabs[8]
+        settings_tab.theme_changed.connect(self._apply_theme)
+        settings_tab.settings_changed.connect(self._on_settings_changed)
+
+        # Lazy tab activation
+        self._tabs.currentChanged.connect(self._on_tab_changed)
 
         status_bar = QStatusBar()
         self._status_label = QLabel("Ready")
@@ -119,6 +143,60 @@ class MainWindow(QMainWindow):
             self._show_main_tabs()
             QTimer.singleShot(300, self._auto_discover_and_load)
 
+    # ------------------------------------------------------------------
+    # Lazy tab materialisation
+    # ------------------------------------------------------------------
+    def _materialise_tab(self, index: int) -> QWidget:
+        """Import, construct, and swap in the real tab widget for *index*."""
+        if index in self._real_tabs:
+            return self._real_tabs[index]
+
+        entry = _TAB_REGISTRY[index]
+        if not entry.get("lazy", False):
+            return self._tabs.widget(index)
+
+        import importlib
+        mod = importlib.import_module(entry["module"])
+        cls = getattr(mod, entry["cls"])
+
+        args_key = entry.get("args")
+        if args_key == "config":
+            widget = cls(self._config)
+        elif args_key == "config_registry":
+            widget = cls(self._config, self._registry)
+        elif args_key == "config_kw":
+            widget = cls(config=self._config)
+        else:
+            widget = cls()
+
+        # Swap placeholder with the real widget, keeping the same index/label
+        old = self._tabs.widget(index)
+        label = self._tabs.tabText(index)
+        enabled = self._tabs.isTabEnabled(index)
+        self._tabs.removeTab(index)
+        self._tabs.insertTab(index, widget, label)
+        self._tabs.setTabEnabled(index, enabled)
+        if old is not None:
+            old.deleteLater()
+
+        self._real_tabs[index] = widget
+        logger.debug("Materialised tab %d (%s)", index, label)
+        return widget
+
+    def _on_tab_changed(self, index: int):
+        """Materialise the tab on first click and initialise if game is loaded."""
+        if index not in self._real_tabs:
+            widget = self._materialise_tab(index)
+            if self._game_loaded:
+                self._init_tab_from_game(index, widget)
+
+    def _tab(self, index: int) -> QWidget | None:
+        """Return the real tab at *index* or None if not yet materialised."""
+        return self._real_tabs.get(index)
+
+    # ------------------------------------------------------------------
+    # Setup tab (always eager)
+    # ------------------------------------------------------------------
     def _build_setup_tab(self) -> QWidget:
         widget = QWidget()
         outer = QVBoxLayout(widget)
@@ -183,6 +261,9 @@ class MainWindow(QMainWindow):
         outer.addWidget(container)
         return widget
 
+    # ------------------------------------------------------------------
+    # Loading page
+    # ------------------------------------------------------------------
     def _build_loading_page(self) -> QWidget:
         widget = QWidget()
         outer = QVBoxLayout(widget)
@@ -211,7 +292,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._loading_detail)
 
         self._loading_bar = QProgressBar()
-        self._loading_bar.setRange(0, 0)
+        self._loading_bar.setRange(0, 100)
         self._loading_bar.setTextVisible(False)
         self._loading_bar.setFixedWidth(320)
         self._loading_bar.setFixedHeight(18)
@@ -221,9 +302,17 @@ class MainWindow(QMainWindow):
         outer.addStretch()
         return widget
 
-    def _show_loading_screen(self, title: str, detail: str = "") -> None:
+    # ------------------------------------------------------------------
+    # UI helpers
+    # ------------------------------------------------------------------
+    def _show_loading_screen(self, title: str, detail: str = "", pct: int = -1) -> None:
         self._loading_title.setText(title)
         self._loading_detail.setText(detail)
+        if pct < 0:
+            self._loading_bar.setRange(0, 0)  # indeterminate
+        else:
+            self._loading_bar.setRange(0, 100)
+            self._loading_bar.setValue(pct)
         self._central_stack.setCurrentWidget(self._loading_page)
         self.setCursor(Qt.WaitCursor)
         self._status_label.setText(title)
@@ -251,6 +340,9 @@ class MainWindow(QMainWindow):
             return False
         return os.path.isfile(os.path.join(path, "meta", "0.papgt"))
 
+    # ------------------------------------------------------------------
+    # Auto-discover
+    # ------------------------------------------------------------------
     def _auto_discover_and_load(self) -> None:
         """Auto-discover game and load it immediately if found (first run)."""
         self._setup_status.setText("Scanning Steam libraries for Crimson Desert...")
@@ -266,7 +358,6 @@ class MainWindow(QMainWindow):
             self._setup_status.setText(f"Found: {path}\nAuto-loading game...")
             self._setup_status.setStyleSheet("color: #a6e3a1;")
             QApplication.processEvents()
-            # Auto-load the game immediately
             self._show_loading_screen(
                 "Loading Crimson Desert...",
                 "Game auto-discovered. Reading package groups and preparing the workspace.",
@@ -323,8 +414,10 @@ class MainWindow(QMainWindow):
         )
         QTimer.singleShot(0, lambda: self._activate_game(path))
 
+    # ------------------------------------------------------------------
+    # Game version / update detection (cheap, runs on main thread)
+    # ------------------------------------------------------------------
     def _detect_game_version(self, packages_path: str) -> str:
-        """Detect game version from PAPGT metadata and file stats."""
         try:
             papgt_path = os.path.join(packages_path, "meta", "0.papgt")
             if not os.path.isfile(papgt_path):
@@ -333,7 +426,6 @@ class MainWindow(QMainWindow):
             size = stat.st_size
             from datetime import datetime
             mod_time = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
-            # Compute CRC fingerprint for version identification
             from core.checksum_engine import pa_checksum
             with open(papgt_path, "rb") as f:
                 data = f.read()
@@ -344,7 +436,6 @@ class MainWindow(QMainWindow):
             return "Unknown"
 
     def _check_game_updates(self, packages_path: str, groups: list[str]) -> dict:
-        """Check for new/changed files since last session. Returns a summary dict."""
         summary = {"new_groups": 0, "new_palocs": 0, "changed_palocs": 0}
         try:
             saved_paloc_count = self._config.get("game.last_paloc_count", 0)
@@ -357,7 +448,6 @@ class MainWindow(QMainWindow):
             if saved_paloc_count > 0:
                 summary["new_palocs"] = max(0, current_paloc_count - saved_paloc_count)
 
-            # Check game fingerprint for any changes
             saved_fp = self._config.get("game.last_fingerprint", "")
             papgt_path = os.path.join(packages_path, "meta", "0.papgt")
             if os.path.isfile(papgt_path):
@@ -367,7 +457,7 @@ class MainWindow(QMainWindow):
                 crc = pa_checksum(data[12:]) if len(data) > 12 else 0
                 current_fp = f"{crc:08X}_{os.path.getsize(papgt_path)}"
                 if saved_fp and current_fp != saved_fp:
-                    summary["changed_palocs"] = 1  # game files changed
+                    summary["changed_palocs"] = 1
                 self._config.set("game.last_fingerprint", current_fp)
 
             self._config.set("game.last_paloc_count", current_paloc_count)
@@ -376,71 +466,135 @@ class MainWindow(QMainWindow):
             logger.warning("Failed to check game updates: %s", e)
         return summary
 
+    # ------------------------------------------------------------------
+    # Background game loading (threaded)
+    # ------------------------------------------------------------------
     def _activate_game(self, packages_path: str) -> None:
-        """Load game data and unlock all tabs with auto-populated data."""
+        """Kick off the background game loader thread."""
+        self._packages_path = packages_path
+        self._config.set("general.last_game_path", packages_path)
+        self._config.save()
+
+        self._show_loading_screen("Loading Crimson Desert...", "Reading package groups.", 0)
+
+        worker = FunctionWorker(self._game_load_task, packages_path)
+        worker.progress.connect(self._on_load_progress)
+        worker.finished_result.connect(self._on_load_finished)
+        worker.error_occurred.connect(self._on_load_error)
+        self._loader_worker = worker
+        worker.start()
+
+    @staticmethod
+    def _scan_paloc_files_parallel(vfs: VfsManager, groups: list[str], progress_cb) -> list[dict]:
+        """Scan all package groups for .paloc files using parallel I/O."""
+        paloc_lang_map = {
+            "eng": "en", "kor": "ko", "jpn": "ja", "rus": "ru",
+            "tur": "tr", "spa-es": "es", "spa-mx": "es-MX",
+            "fre": "fr", "ger": "de", "ita": "it", "pol": "pl",
+            "por-br": "pt-BR", "zho-tw": "zh-TW", "zho-cn": "zh",
+            "tha": "th", "vie": "vi", "ind": "id", "ara": "ar",
+        }
+        results = []
+        total = len(groups)
+
+        def _scan_group(group: str) -> list[dict]:
+            found = []
+            try:
+                pamt = vfs.load_pamt(group)
+                for entry in pamt.file_entries:
+                    if entry.path.lower().endswith(".paloc"):
+                        basename = os.path.basename(entry.path)
+                        name_part = basename.replace("localizationstring_", "").replace(".paloc", "")
+                        lang_code = paloc_lang_map.get(name_part, name_part)
+                        found.append({
+                            "filename": basename,
+                            "lang_code": lang_code,
+                            "lang_key": name_part,
+                            "group": group,
+                            "entry": entry,
+                        })
+            except Exception as e:
+                logger.warning("Error scanning group %s for palocs: %s", group, e)
+            return found
+
+        # Use up to 8 threads for parallel PAMT I/O
+        with ThreadPoolExecutor(max_workers=min(8, total or 1)) as pool:
+            futures = {pool.submit(_scan_group, g): g for g in groups}
+            done_count = 0
+            for future in as_completed(futures):
+                done_count += 1
+                results.extend(future.result())
+                if done_count % 4 == 0 or done_count == total:
+                    pct = int((done_count / total) * 30) + 10  # 10-40%
+                    progress_cb(pct, f"Scanning localization: {done_count}/{total} groups")
+        return results
+
+    def _game_load_task(self, worker: FunctionWorker, packages_path: str) -> dict:
+        """Heavy I/O work that runs on the background thread.
+
+        Returns a dict with everything the main thread needs to finish setup.
+        """
+        worker.report_progress(5, "Reading package groups.")
+        vfs = VfsManager(packages_path)
+        groups = vfs.list_package_groups()
+
+        worker.report_progress(10, f"Scanning localization across {len(groups)} groups.")
+        palocs = self._scan_paloc_files_parallel(vfs, groups, worker.report_progress)
+
+        worker.report_progress(45, "Detecting game version.")
+        game_version = self._detect_game_version(packages_path)
+
+        worker.report_progress(50, "Background loading complete.")
+        return {
+            "vfs": vfs,
+            "groups": groups,
+            "palocs": palocs,
+            "game_version": game_version,
+            "packages_path": packages_path,
+        }
+
+    def _on_load_progress(self, pct: int, msg: str):
+        self._show_loading_screen("Loading Crimson Desert...", msg, pct)
+
+    def _on_load_finished(self, result: dict):
+        """Runs on the main thread after the background loader finishes."""
         try:
-            self._packages_path = packages_path
-            self._config.set("general.last_game_path", packages_path)
-            self._config.save()
+            self._vfs = result["vfs"]
+            self._all_groups = result["groups"]
+            self._discovered_palocs = result["palocs"]
+            self._game_version = result["game_version"]
+            self._packages_path = result["packages_path"]
+            groups = self._all_groups
 
-            self._show_loading_screen(
-                "Loading Crimson Desert...",
-                "Reading package groups.",
-            )
-            self._vfs = VfsManager(packages_path)
-            groups = self._vfs.list_package_groups()
+            # ---- Initialise only the Explorer tab eagerly (it's the landing tab) ----
+            self._show_loading_screen("Loading Crimson Desert...", "Building the Explorer file index.", 55)
+            explorer = self._materialise_tab(1)
+            explorer.initialize_from_game(self._vfs, groups)
+            explorer.files_extracted.connect(self._on_files_extracted)
+            explorer._game_initialized = True
 
-            self._show_loading_screen(
-                "Loading Crimson Desert...",
-                f"Scanning localization files across {len(groups)} package groups.",
-            )
-            self._discovered_palocs = self._scan_paloc_files(packages_path, groups)
+            # ---- All other tabs initialise lazily on first click ----
+            self._show_loading_screen("Loading Crimson Desert...", "Finalising.", 90)
 
-            # Detect game version
-            self._show_loading_screen(
-                "Loading Crimson Desert...",
-                "Detecting game version and checking for updates.",
-            )
-            game_version = self._detect_game_version(packages_path)
-            update_summary = self._check_game_updates(packages_path, groups)
-
-            self._show_loading_screen(
-                "Loading Crimson Desert...",
-                "Building the Explorer file index.",
-            )
-            self._explorer_tab.initialize_from_game(self._vfs, groups)
-
-            self._show_loading_screen(
-                "Loading Crimson Desert...",
-                "Initializing Item Catalog, Dialogue Catalog, Repack, Translate, and Font tools.",
-            )
-            self._item_catalog_tab.initialize_from_game(self._vfs)
-            self._dialogue_catalog_tab.initialize_from_game(self._vfs)
-            self._repack_tab.initialize_from_game(packages_path)
-            self._translate_tab.initialize_from_game(self._vfs, self._discovered_palocs)
-            self._font_tab.initialize_from_game(self._vfs)
-            self._audio_tab.initialize_from_game(self._vfs, groups)
+            update_summary = self._check_game_updates(self._packages_path, groups)
 
             self._unlock_tabs()
             self._game_loaded = True
 
-            self._show_loading_screen(
-                "Loading Crimson Desert...",
-                "Restoring your last translation session.",
-            )
-            if self._translate_tab.restore_state():
-                self._tabs.setCurrentIndex(3)
+            # Restore translate session if it was the last active tab
+            translate_tab = self._tab(5)  # Translate
+            if translate_tab and hasattr(translate_tab, 'restore_state') and translate_tab.restore_state():
+                self._tabs.setCurrentIndex(5)
             else:
                 self._tabs.setCurrentIndex(1)
 
             paloc_count = len(self._discovered_palocs)
-            self._game_version_label.setText(f"Game: {game_version}")
+            self._game_version_label.setText(f"Game: {self._game_version}")
             self._status_label.setText(
                 f"Game loaded: {len(groups)} package groups, {paloc_count} localization files"
             )
             self._files_label.setText(f"Groups: {len(groups)} | Languages: {paloc_count}")
 
-            # Show update notification if game files changed
             has_updates = (
                 update_summary["new_groups"] > 0
                 or update_summary["new_palocs"] > 0
@@ -464,52 +618,51 @@ class MainWindow(QMainWindow):
             self._show_main_tabs()
             logger.info(
                 "Game activated: %s (%d groups, %d palocs) version=%s",
-                packages_path, len(groups), paloc_count, game_version,
+                self._packages_path, len(groups), paloc_count, self._game_version,
             )
         except Exception as e:
-            self._lock_tabs()
-            self._show_main_tabs()
-            self._game_loaded = False
-            self._status_label.setText("Failed to load game")
-            self._setup_status.setText(f"Failed to load game:\n{e}")
-            self._setup_status.setStyleSheet("color: #f38ba8;")
-            logger.exception("Failed to activate game: %s", packages_path)
-            show_error(self, "Load Error", str(e))
+            self._on_load_error(str(e))
 
-    def _scan_paloc_files(self, packages_path: str, groups: list[str]) -> list[dict]:
-        """Scan all package groups for .paloc localization files."""
-        paloc_lang_map = {
-            "eng": "en", "kor": "ko", "jpn": "ja", "rus": "ru",
-            "tur": "tr", "spa-es": "es", "spa-mx": "es-MX",
-            "fre": "fr", "ger": "de", "ita": "it", "pol": "pl",
-            "por-br": "pt-BR", "zho-tw": "zh-TW", "zho-cn": "zh",
-            "tha": "th", "vie": "vi", "ind": "id", "ara": "ar",
-        }
-        results = []
-        for i, group in enumerate(groups, start=1):
-            if i == 1 or i == len(groups) or i % 4 == 0:
-                self._show_loading_screen(
-                    "Loading Crimson Desert...",
-                    f"Scanning localization files: group {group} ({i}/{len(groups)}).",
-                )
-            try:
-                pamt = self._vfs.load_pamt(group)
-                for entry in pamt.file_entries:
-                    if entry.path.lower().endswith(".paloc"):
-                        basename = os.path.basename(entry.path)
-                        name_part = basename.replace("localizationstring_", "").replace(".paloc", "")
-                        lang_code = paloc_lang_map.get(name_part, name_part)
-                        results.append({
-                            "filename": basename,
-                            "lang_code": lang_code,
-                            "lang_key": name_part,
-                            "group": group,
-                            "entry": entry,
-                        })
-            except Exception as e:
-                logger.warning("Error scanning group %s for palocs: %s", group, e)
-        return results
+    def _on_load_error(self, error_msg: str):
+        self._lock_tabs()
+        self._show_main_tabs()
+        self._game_loaded = False
+        self._status_label.setText("Failed to load game")
+        self._setup_status.setText(f"Failed to load game:\n{error_msg}")
+        self._setup_status.setStyleSheet("color: #f38ba8;")
+        logger.exception("Failed to activate game: %s", error_msg)
+        show_error(self, "Load Error", error_msg)
 
+    # ------------------------------------------------------------------
+    # Per-tab lazy initialisation (called when a tab is first shown)
+    # ------------------------------------------------------------------
+    def _init_tab_from_game(self, index: int, widget: QWidget):
+        """Initialise a single tab from game data. Called lazily on first click."""
+        try:
+            if index == 1:   # Explorer (usually already done in _on_load_finished)
+                if not hasattr(widget, '_game_initialized'):
+                    widget.initialize_from_game(self._vfs, self._all_groups)
+                    widget.files_extracted.connect(self._on_files_extracted)
+                    widget._game_initialized = True
+            elif index == 2:  # Item Catalog
+                widget.initialize_from_game(self._vfs)
+            elif index == 3:  # Dialogue Catalog
+                widget.initialize_from_game(self._vfs)
+            elif index == 4:  # Repack
+                widget.initialize_from_game(self._packages_path)
+            elif index == 5:  # Translate
+                widget.initialize_from_game(self._vfs, self._discovered_palocs)
+            elif index == 6:  # Audio
+                widget.initialize_from_game(self._vfs, self._all_groups)
+            elif index == 7:  # Font
+                widget.initialize_from_game(self._vfs)
+        except Exception as e:
+            logger.exception("Failed to initialise tab %d: %s", index, e)
+            show_error(self, "Tab Init Error", f"Failed to initialise {_TAB_REGISTRY[index]['label']}: {e}")
+
+    # ------------------------------------------------------------------
+    # Misc
+    # ------------------------------------------------------------------
     def _on_files_extracted(self, output_path: str):
         self._status_label.setText(f"Extracted to: {output_path}")
 
@@ -521,18 +674,24 @@ class MainWindow(QMainWindow):
         self._config.set("general.theme", theme_name)
 
     def _on_settings_changed(self):
-        self._translate_tab.refresh_from_settings()
-        try:
-            self._audio_tab.refresh_from_settings()
-        except Exception:
-            pass
+        translate_tab = self._tab(5)
+        if translate_tab and hasattr(translate_tab, 'refresh_from_settings'):
+            translate_tab.refresh_from_settings()
+        audio_tab = self._tab(6)
+        if audio_tab and hasattr(audio_tab, 'refresh_from_settings'):
+            try:
+                audio_tab.refresh_from_settings()
+            except Exception:
+                pass
         self._status_label.setText("Settings updated")
 
     def closeEvent(self, event):
-        try:
-            self._translate_tab.save_state()
-        except Exception as e:
-            logger.error("Failed to save translation state: %s", e)
+        translate_tab = self._tab(5)
+        if translate_tab and hasattr(translate_tab, 'save_state'):
+            try:
+                translate_tab.save_state()
+            except Exception as e:
+                logger.error("Failed to save translation state: %s", e)
         try:
             self._config.save()
         except Exception as e:

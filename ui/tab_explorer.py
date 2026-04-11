@@ -460,6 +460,9 @@ class ExplorerTab(QWidget):
         self._view.setShowGrid(False)
         self._view.verticalHeader().setVisible(False)
         self._view.verticalHeader().setDefaultSectionSize(24)
+        self._view.verticalHeader().setMinimumSectionSize(24)
+        self._view.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self._view.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self._view.horizontalHeader().setSectionResizeMode(_COL_FILE, QHeaderView.Stretch)
         self._view.horizontalHeader().setSectionResizeMode(_COL_SIZE, QHeaderView.Fixed)
         self._view.horizontalHeader().setSectionResizeMode(_COL_TYPE, QHeaderView.Fixed)
@@ -628,36 +631,57 @@ class ExplorerTab(QWidget):
             return
         try:
             if group == ALL_PACKAGES:
+                # Async load — filter + scope applied in _on_all_packages_loaded
                 self._load_all_packages()
             else:
                 pamt = self._vfs.load_pamt(group)
                 rows = [self._build_row(e, group) for e in pamt.file_entries]
                 self._model.set_data(rows)
-            self._apply_filter()
-            if group == ALL_PACKAGES and self._pending_scope_request:
-                paths, preferred_path, title = self._pending_scope_request
-                self._pending_scope_request = None
-                self._apply_workbench_scope(paths, preferred_path, title)
+                self._apply_filter()
         except Exception as e:
             show_error(self, "Load Error", str(e))
 
     def _load_all_packages(self):
+        """Load all packages in a background thread to keep UI responsive."""
         self._progress.set_progress(0, "Loading all packages...")
-        QApplication.processEvents()
-        all_rows = []
-        for i, group in enumerate(self._all_groups):
-            try:
-                pamt = self._vfs.load_pamt(group)
-                for entry in pamt.file_entries:
-                    all_rows.append(self._build_row(entry, group))
-            except Exception as e:
-                logger.warning("Error loading group %s: %s", group, e)
-            if (i + 1) % 5 == 0:
-                pct = int(((i + 1) / len(self._all_groups)) * 100)
-                self._progress.set_progress(pct, f"Loading group {group}...")
-                QApplication.processEvents()
+        self._view.setUpdatesEnabled(False)
+
+        def _bg_load(worker: FunctionWorker, vfs, groups, build_row):
+            all_rows = []
+            total = len(groups)
+            for i, group in enumerate(groups):
+                if worker.is_cancelled():
+                    return all_rows
+                try:
+                    pamt = vfs.load_pamt(group)
+                    for entry in pamt.file_entries:
+                        all_rows.append(build_row(entry, group))
+                except Exception as e:
+                    logger.warning("Error loading group %s: %s", group, e)
+                if (i + 1) % 3 == 0 or (i + 1) == total:
+                    pct = int(((i + 1) / total) * 100)
+                    worker.report_progress(pct, f"Loading group {group} ({i+1}/{total})...")
+            return all_rows
+
+        w = FunctionWorker(_bg_load, self._vfs, self._all_groups, self._build_row)
+        w.progress.connect(lambda pct, msg: self._progress.set_progress(pct, msg))
+        w.finished_result.connect(self._on_all_packages_loaded)
+        w.error_occurred.connect(lambda err: (
+            self._view.setUpdatesEnabled(True),
+            show_error(self, "Load Error", err),
+        ))
+        self._worker = w
+        w.start()
+
+    def _on_all_packages_loaded(self, all_rows):
         self._model.set_data(all_rows)
+        self._view.setUpdatesEnabled(True)
+        self._apply_filter()
         self._progress.set_progress(100, f"Loaded {len(all_rows):,} files from {len(self._all_groups)} packages")
+        if self._pending_scope_request:
+            paths, preferred_path, title = self._pending_scope_request
+            self._pending_scope_request = None
+            self._apply_workbench_scope(paths, preferred_path, title)
 
     def _apply_filter(self):
         filter_name = self._type_filter.currentText()

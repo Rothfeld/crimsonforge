@@ -17,11 +17,29 @@ VERSION BUMPING RULES
 __all__ = ["APP_VERSION", "APP_NAME", "CHANGELOG"]
 
 APP_NAME = "CrimsonForge"
-APP_VERSION = "1.16.1"
+APP_VERSION = "1.17.0"
 
 # Each entry: (version, date, list_of_changes)
 # Newest first. `date` is YYYY-MM-DD.
 CHANGELOG: list[tuple[str, str, list[str]]] = [
+    (
+        "1.17.0", "2026-04-11", [
+            "[Performance] Tabs are now lazily instantiated — only constructed when first clicked, cutting app startup time dramatically",
+            "[Performance] Game loading moved to a background thread with a live progress bar so the UI stays fully responsive during initialization",
+            "[Performance] PAMT scanning across all package groups now runs in parallel using up to 8 I/O threads via concurrent.futures",
+            "[Performance] Explorer 'All Packages' loading moved to a background thread — no more UI freeze when browsing 1.45M+ files",
+            "[Performance] All QTreeWidget instances now use setUniformRowHeights for instant height calculation instead of per-row measurement",
+            "[Performance] All QTableView instances now use fixed row heights and per-pixel scrolling for smoother scroll performance",
+            "[Performance] Dialogue Catalog and Item Catalog tree population wrapped with setUpdatesEnabled(False) to eliminate mass repaints during bulk insertion",
+            "[Fix] 'Import WAV + Patch to Game' now correctly invalidates the audio player cache after patching so the new audio plays back immediately instead of the stale original",
+            "[Fix] Mod Manager ZIP generation no longer crashes with a KeyError on asset_count — the manifest now includes the missing field",
+            "[Fix] Added numpy to requirements.txt — resolves 'No module named numpy' error for 3D mesh preview",
+            "[Community] OmniVoice TTS: added advanced parameters UI with individual toggles for Gender, Age, Pitch, Style, and Accent (contributed by imedox)",
+            "[Community] OmniVoice TTS: added full PAZ location column, renamed JA to CH language code, made language dropdown searchable, and improved TTS UI styling (contributed by imedox)",
+            "[Community] OmniVoice TTS: improved ref text auto-fill behavior and enabled text column resizing (contributed by imedox)",
+            "[Community] OmniVoice TTS: updated and expanded supported language list (contributed by imedox)",
+        ],
+    ),
     (
         "1.16.1", "2026-04-08", [
             "[Fix] Standalone Windows builds now bundle ffmpeg and vgmstream helper tools directly inside the packaged app so audio workflows run on clean machines without first-run downloads",

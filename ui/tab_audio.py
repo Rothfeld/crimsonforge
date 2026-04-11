@@ -365,6 +365,9 @@ class AudioTab(QWidget):
         self._view.setShowGrid(False)
         self._view.verticalHeader().setVisible(False)
         self._view.verticalHeader().setDefaultSectionSize(22)
+        self._view.verticalHeader().setMinimumSectionSize(22)
+        self._view.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self._view.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self._view.horizontalHeader().setSectionResizeMode(_COL_FILE, QHeaderView.Interactive)
         self._view.horizontalHeader().setSectionResizeMode(_COL_TEXT, QHeaderView.Interactive)
         self._view.setColumnWidth(_COL_FILE, 280)
@@ -1169,6 +1172,9 @@ class AudioTab(QWidget):
             mf = ModifiedFile(data=new, entry=entry, pamt_data=pamt, package_group=grp)
             result = RepackEngine(game).repack([mf], papgt_path=papgt)
             if result.success:
+                # Invalidate the cached WAV so the player reads fresh data
+                ck = f"{grp}:{entry.path}"
+                self._wav_cache.pop(ck, None)
                 show_info(self, "Patched", f"Patched {entry.path}")
             else:
                 show_error(self, "Error", "\n".join(result.errors) if getattr(result, "errors", None) else "Patch failed")
