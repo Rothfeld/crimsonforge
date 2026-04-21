@@ -98,6 +98,17 @@ class SubMesh:
     source_bbox_min: tuple[float, float, float] = (0.0, 0.0, 0.0)
     source_bbox_extent: tuple[float, float, float] = (0.0, 0.0, 0.0)
     source_lod_count: int = 0
+    # Per-imported-vertex back-reference to the vertex slot in the
+    # ORIGINAL submesh that this one was sourced from, or -1 when the
+    # vertex was added after export (user inserted new geometry in
+    # Blender). Populated by the OBJ importer when a ``.cfmeta.json``
+    # sidecar was written during export, or by positional matching
+    # when no sidecar is available. The PAC rebuilder uses this to
+    # pick the correct donor vertex record (which carries bone
+    # indices + weights + normals) instead of falling back to the
+    # nearest-position heuristic, which is fragile when the user
+    # actually moves vertices.
+    source_vertex_map: list[int] = field(default_factory=list)
 
 
 @dataclass

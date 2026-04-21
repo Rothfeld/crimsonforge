@@ -32,6 +32,12 @@ def export_obj(mesh: ParsedMesh, output_dir: str, name: str = "",
                split_submeshes: bool = False, scale: float = 1.0) -> list[str]:
     """Export mesh to OBJ + MTL files.
 
+    Also writes a ``<base>.cfmeta.json`` sidecar that records the skin
+    weights OBJ can't carry (bone indices + weights per vertex, plus
+    an identity vertex→source map the re-importer uses to rebuild
+    PAC donor records). The sidecar is optional; re-import falls back
+    gracefully to positional donor matching when it's missing.
+
     Args:
         mesh: Parsed mesh data.
         output_dir: Directory to write files.
@@ -40,7 +46,7 @@ def export_obj(mesh: ParsedMesh, output_dir: str, name: str = "",
         scale: Scale factor applied to all vertices.
 
     Returns:
-        List of output file paths.
+        List of output file paths (OBJ, MTL, and sidecar if any skin data).
     """
     os.makedirs(output_dir, exist_ok=True)
     base = name or Path(mesh.path).stem
@@ -111,9 +117,56 @@ def export_obj(mesh: ParsedMesh, output_dir: str, name: str = "",
     with open(obj_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
+    output_paths = [obj_path, mtl_path]
+    sidecar_path = _write_cfmeta_sidecar(mesh, obj_path)
+    if sidecar_path:
+        output_paths.append(sidecar_path)
+
     logger.info("Exported OBJ: %s (%d verts, %d faces)", obj_path,
                 mesh.total_vertices, mesh.total_faces)
-    return [obj_path, mtl_path]
+    return output_paths
+
+
+def _write_cfmeta_sidecar(mesh: ParsedMesh, obj_path: str) -> str | None:
+    """Write the ``<obj>.cfmeta.json`` sidecar with skin data.
+
+    The sidecar is a stable, forward-compatible JSON format keyed by
+    ``schema_version`` so older releases of CrimsonForge can refuse
+    to consume newer sidecars rather than silently corrupting a
+    rebuild. We only write the sidecar when at least one submesh
+    carries bone indices — there's nothing to preserve otherwise.
+    """
+    has_skin = any(sm.bone_indices for sm in mesh.submeshes)
+    if not has_skin:
+        return None
+
+    import json
+
+    submeshes_json = []
+    for sm in mesh.submeshes:
+        submeshes_json.append({
+            "name": sm.name,
+            "vertex_count": len(sm.vertices),
+            "bone_indices": [list(b) for b in sm.bone_indices],
+            "bone_weights": [list(w) for w in sm.bone_weights],
+        })
+
+    payload = {
+        "schema_version": 1,
+        "tool": "CrimsonForge",
+        "source_path": mesh.path,
+        "source_format": mesh.format,
+        "submeshes": submeshes_json,
+    }
+
+    sidecar_path = obj_path + ".cfmeta.json"
+    try:
+        with open(sidecar_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, separators=(",", ":"))
+    except OSError as e:
+        logger.warning("Failed to write cfmeta sidecar %s: %s", sidecar_path, e)
+        return None
+    return sidecar_path
 
 
 def _export_obj_split(mesh, output_dir, base, scale):

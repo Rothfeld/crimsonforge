@@ -48,15 +48,60 @@ def _resolve_obj_index(raw_index: str, item_count: int) -> int:
 #  OBJ IMPORTER
 # ═══════════════════════════════════════════════════════════════════════
 
+def _load_cfmeta_sidecar(obj_path: str) -> dict | None:
+    """Read the ``<obj>.cfmeta.json`` sidecar if present.
+
+    The sidecar lives next to the OBJ and records skin weights +
+    vertex counts per submesh so a round-trip through Blender can
+    still rebuild PAC skin data correctly. Returns None when the
+    sidecar is missing or malformed — callers must tolerate that
+    case, because Blender users may edit the OBJ in a path that
+    loses the sidecar.
+    """
+    import json
+    sidecar_path = obj_path + ".cfmeta.json"
+    if not os.path.isfile(sidecar_path):
+        return None
+    try:
+        with open(sidecar_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("Failed to read cfmeta sidecar %s: %s", sidecar_path, e)
+        return None
+    if not isinstance(data, dict) or data.get("schema_version") != 1:
+        logger.warning(
+            "cfmeta sidecar %s has unsupported schema_version %s",
+            sidecar_path, data.get("schema_version") if isinstance(data, dict) else "n/a",
+        )
+        return None
+    return data
+
+
 def import_obj(obj_path: str) -> ParsedMesh:
     """Import an OBJ file back into a ParsedMesh.
 
     Reads CrimsonForge metadata comments (source_path, source_format)
-    to identify the original game file.
+    to identify the original game file. Also loads the optional
+    ``<obj>.cfmeta.json`` sidecar to recover skin weights + vertex
+    identity across the Blender round-trip. When the sidecar is
+    present:
+
+      * ``SubMesh.source_vertex_map`` is populated so the PAC
+        rebuilder picks the correct donor record for each vertex
+        (survives user edits that move vertices far from any
+        original position).
+      * ``SubMesh.bone_indices`` / ``bone_weights`` are propagated
+        from the original mesh, and correctly duplicated when a
+        vertex gets split by the UV-seam handling below.
+
+    When the sidecar is absent, the importer falls back to the
+    pre-v1.22.3 behaviour (empty skin data, positional donor
+    matching in ``build_pac``).
 
     Returns:
         ParsedMesh with vertices, UVs, normals, faces per submesh.
     """
+    sidecar = _load_cfmeta_sidecar(obj_path)
     source_path = ""
     source_format = ""
     submeshes: list[SubMesh] = []
@@ -197,6 +242,16 @@ def import_obj(obj_path: str) -> ParsedMesh:
     vt_offset = 0
     vn_offset = 0
 
+    # Build a lookup keyed on submesh name so we can find the sidecar
+    # record for each imported submesh. Names must match; Blender
+    # preserves `o` lines verbatim on export, so this is reliable.
+    sidecar_by_name: dict[str, dict] = {}
+    if sidecar is not None:
+        for sm_json in sidecar.get("submeshes", []) or []:
+            name = sm_json.get("name", "") or ""
+            if name:
+                sidecar_by_name[name] = sm_json
+
     for si, sm_data in enumerate(submesh_list):
         nv = sm_vert_counts[si] if si < len(sm_vert_counts) else 0
         nvt = sm_uv_counts[si] if si < len(sm_uv_counts) else 0
@@ -221,6 +276,41 @@ def import_obj(obj_path: str) -> ParsedMesh:
         local_verts = list(base_verts)
         local_uvs = list(base_uvs)
         local_normals = list(base_normals)
+
+        # Sidecar-driven skin data. When present, bone_indices/weights
+        # start out indexed by the ORIGINAL vertex slot (identity with
+        # base_verts). We maintain the same indexing for local_verts
+        # and clone alongside whenever _resolve_corner_index clones.
+        sidecar_record = sidecar_by_name.get(sm_data["name"]) if sidecar_by_name else None
+        sidecar_bone_indices: list[tuple[int, ...]] = []
+        sidecar_bone_weights: list[tuple[float, ...]] = []
+        if sidecar_record is not None:
+            # Tolerate a vertex-count mismatch (e.g. user added geometry
+            # in Blender) by clamping / padding. The extras end up with
+            # empty skin data — caller's build path handles that via
+            # the positional fallback for truly new vertices.
+            raw_bi = sidecar_record.get("bone_indices", []) or []
+            raw_bw = sidecar_record.get("bone_weights", []) or []
+            for i in range(nv):
+                if i < len(raw_bi):
+                    try:
+                        sidecar_bone_indices.append(tuple(int(x) for x in raw_bi[i]))
+                    except (TypeError, ValueError):
+                        sidecar_bone_indices.append(())
+                else:
+                    sidecar_bone_indices.append(())
+                if i < len(raw_bw):
+                    try:
+                        sidecar_bone_weights.append(tuple(float(x) for x in raw_bw[i]))
+                    except (TypeError, ValueError):
+                        sidecar_bone_weights.append(())
+                else:
+                    sidecar_bone_weights.append(())
+
+        # Per local-slot back-pointer to the vertex slot in the ORIGINAL
+        # submesh this one came from. Starts as identity; clones inherit
+        # from the slot they were cloned from.
+        source_vertex_map: list[int] = list(range(nv))
 
         assigned_uvs: list[tuple[float, float] | None] = [None] * nv
         assigned_normals: list[tuple[float, float, float] | None] = [None] * nv
@@ -263,10 +353,20 @@ def import_obj(obj_path: str) -> ParsedMesh:
                 split_vertex_map[key] = local_vi
                 return local_vi
 
+            # Clone the vertex slot. Critically: propagate the bone
+            # data + source index so the PAC rebuilder can route the
+            # clone to the correct donor. Before v1.22.3 only the
+            # position/uv/normal were cloned, which silently dropped
+            # skin weights on UV-seam vertices and made the mesh
+            # "explode" in-game after repack.
             clone_idx = len(local_verts)
             local_verts.append(base_verts[local_vi])
             local_uvs.append(uv_value)
             local_normals.append(normal_value)
+            source_vertex_map.append(source_vertex_map[local_vi])
+            if sidecar_record is not None:
+                sidecar_bone_indices.append(sidecar_bone_indices[local_vi])
+                sidecar_bone_weights.append(sidecar_bone_weights[local_vi])
             split_vertex_map[key] = clone_idx
             return clone_idx
 
@@ -285,8 +385,11 @@ def import_obj(obj_path: str) -> ParsedMesh:
             uvs=local_uvs if len(local_uvs) == len(local_verts) else [],
             normals=local_normals if len(local_normals) == len(local_verts) else [],
             faces=local_faces,
+            bone_indices=sidecar_bone_indices if sidecar_record is not None else [],
+            bone_weights=sidecar_bone_weights if sidecar_record is not None else [],
             vertex_count=len(local_verts),
             face_count=len(local_faces),
+            source_vertex_map=source_vertex_map,
         )
         submeshes.append(sm)
 
@@ -2295,7 +2398,35 @@ def _build_pac_full_rebuild(
                 )
             donor_records.append(original_data[rec_off:rec_off + orig_sm.source_vertex_stride])
 
-        donor_indices = _choose_pac_donor_indices(orig_sm, new_sm)
+        # Prefer the source_vertex_map recorded by the OBJ importer
+        # (populated from the .cfmeta.json sidecar). It tracks the
+        # ORIGINAL vertex slot each imported vertex came from, which
+        # survives user edits that move vertices too far from their
+        # original position for the nearest-position heuristic to
+        # recover correctly. Fall back to positional donor matching
+        # for legacy OBJs without a sidecar or for truly-new vertices
+        # (source index == -1, e.g. user inserted geometry in Blender).
+        orig_vertex_count = len(orig_sm.vertices)
+        donor_indices: list[int] = []
+        need_positional_fallback = False
+        if new_sm.source_vertex_map and len(new_sm.source_vertex_map) == len(new_sm.vertices):
+            for svm in new_sm.source_vertex_map:
+                if 0 <= svm < orig_vertex_count:
+                    donor_indices.append(svm)
+                else:
+                    # Placeholder — replaced below by positional match.
+                    donor_indices.append(-1)
+                    need_positional_fallback = True
+        else:
+            donor_indices = [-1] * len(new_sm.vertices)
+            need_positional_fallback = True
+
+        if need_positional_fallback:
+            positional = _choose_pac_donor_indices(orig_sm, new_sm)
+            donor_indices = [
+                (pos if d < 0 else d)
+                for d, pos in zip(donor_indices, positional)
+            ]
         normals = (
             new_sm.normals
             if len(new_sm.normals) == len(new_sm.vertices)

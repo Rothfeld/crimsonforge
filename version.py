@@ -17,11 +17,21 @@ VERSION BUMPING RULES
 __all__ = ["APP_VERSION", "APP_NAME", "CHANGELOG"]
 
 APP_NAME = "CrimsonForge"
-APP_VERSION = "1.22.2"
+APP_VERSION = "1.22.3"
 
 # Each entry: (version, date, list_of_changes)
 # Newest first. `date` is YYYY-MM-DD.
 CHANGELOG: list[tuple[str, str, list[str]]] = [
+    (
+        "1.22.3", "2026-04-21", [
+            "[Fix] OBJ re-import no longer loses skin weights on UV-seam vertices. When Blender splits a vertex for multiple UV/normal corners, the clone now inherits its source slot's bone indices and bone weights. Root cause of the reported 'model exploded after import' symptom.",
+            "[Feature] New `.cfmeta.json` sidecar written next to every exported OBJ carries the original skin data (bone indices + weights per vertex). On re-import, the sidecar populates the source-vertex map so the PAC rebuilder picks the correct donor record for each vertex — survives user edits that move vertices far from any original position. Falls back gracefully to positional matching when the sidecar is absent.",
+            "[Fix] Repack tab no longer appears empty after game load. `initialize_from_game()` now restores the last-used Modified Files directory from config and auto-scans it; a clear next-step hint is shown when nothing is configured.",
+            "[Fix] Ship-to-App dialog no longer freezes the window during ZIP generation. `build_mesh_manager_package` and `build_mesh_ship_package` now run on a background `FunctionWorker`; progress bar updates live and the dialog surfaces errors instead of locking up.",
+            "[Fix] FBX export of a PAC with a missing `.pab` skeleton no longer silently falls back to mesh-only. The exporter now searches every loaded PAMT first by sibling path, then by basename, and surfaces a confirmation dialog (with the exact reason) before producing an armature-less FBX.",
+            "[Enhancement] `SubMesh.source_vertex_map` added — per-imported-vertex back-reference to the original slot. Consumed by the PAC full-rebuild path to route donor records correctly; empty when unused.",
+        ],
+    ),
     (
         "1.22.2", "2026-04-21", [
             "[Fix] Tab switching no longer freezes the window on first click. Materialisation is now three-phase: the loading overlay paints first, widget construction runs on the next UI tick, and game-data init runs on a background thread.",

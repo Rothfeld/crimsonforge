@@ -37,6 +37,7 @@ from core.mesh_ship_builder import (
     write_mesh_ship_zip,
 )
 from core.pamt_parser import PamtFileEntry
+from utils.thread_worker import FunctionWorker
 
 
 class ShipMeshDialog(QDialog):
@@ -59,6 +60,10 @@ class ShipMeshDialog(QDialog):
             key.lower(): value for key, value in (prefilled_obj_paths or {}).items()
         }
         self._item_index = item_index
+        # Background worker for ZIP generation. Held on ``self`` so it
+        # survives past the click handler that starts it; None when no
+        # build is in flight.
+        self._build_worker: FunctionWorker | None = None
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -339,6 +344,20 @@ class ShipMeshDialog(QDialog):
         return requests
 
     def _do_generate(self) -> None:
+        """Kick off the ZIP build on a background worker.
+
+        The build is disk-heavy: ``build_mesh_manager_package`` /
+        ``build_mesh_ship_package`` re-pack PAZ/PAMT/PAPGT archives
+        which can take 10-60 seconds on a full character mesh. Running
+        that on the UI thread is what froze the window ("Ship to app
+        seems to do nothing, bugs out the whole interface"). We now
+        off-load to :class:`FunctionWorker`; the Generate button stays
+        disabled and the progress bar updates live via the worker's
+        ``progress`` signal.
+        """
+        if self._build_worker is not None and self._build_worker.isRunning():
+            return   # ignore double-clicks; build already in flight
+
         mod_name = self._mod_name.text().strip()
         author = self._author.text().strip()
         version = self._version.text().strip()
@@ -391,8 +410,21 @@ class ShipMeshDialog(QDialog):
         self._generate_btn.setEnabled(False)
         self._progress.setVisible(True)
         self._progress.setValue(0)
+        self._status.setText("Building mesh package…")
 
-        try:
+        include_paired_lod = self._include_paired_lod.isChecked()
+
+        # Build task runs on the worker thread. No Qt widgets are
+        # touched from here — all UI updates go through the worker's
+        # ``progress`` signal (marshalled to the main thread by Qt) and
+        # the finished_result / error_occurred slots below.
+        def task(worker: FunctionWorker):
+            def progress_cb(pct: int, message: str) -> None:
+                if worker.is_cancelled():
+                    return
+                # Cap at 90 so we have room for the final ZIP write.
+                worker.report_progress(max(0, min(90, pct)), message)
+
             if package_mode == "manager":
                 package = build_mesh_manager_package(
                     self._vfs,
@@ -400,11 +432,10 @@ class ShipMeshDialog(QDialog):
                     mod_name=mod_name,
                     author=author,
                     version=version,
-                    include_paired_lod=self._include_paired_lod.isChecked(),
-                    progress_callback=self._on_progress,
+                    include_paired_lod=include_paired_lod,
+                    progress_callback=progress_cb,
                 )
-                self._progress.setValue(92)
-                self._status.setText("Writing manager ZIP...")
+                worker.report_progress(92, "Writing manager ZIP…")
                 write_mesh_manager_zip(save_path, package, mod_name, author, version)
             else:
                 package = build_mesh_ship_package(
@@ -413,39 +444,72 @@ class ShipMeshDialog(QDialog):
                     mod_name=mod_name,
                     author=author,
                     version=version,
-                    include_paired_lod=self._include_paired_lod.isChecked(),
-                    progress_callback=self._on_progress,
+                    include_paired_lod=include_paired_lod,
+                    progress_callback=progress_cb,
                 )
-                self._progress.setValue(92)
-                self._status.setText("Writing standalone ZIP...")
+                worker.report_progress(92, "Writing standalone ZIP…")
                 write_mesh_ship_zip(save_path, package, mod_name, author, version)
-            self._progress.setValue(100)
-            self._status.setText("Mesh package ready.")
-            if package_mode == "manager":
-                QMessageBox.information(
-                    self,
-                    "Done",
-                    f"ZIP saved to:\n{save_path}\n\n"
-                    f"Assets: {package.manifest['asset_count']}\n"
-                    f"Loose files: {package.manifest['file_count']}\n\n"
-                    "Import this ZIP into CDUMM, Crimson Browser, or another loose-file aware mod manager.",
-                )
-            else:
-                QMessageBox.information(
-                    self,
-                    "Done",
-                    f"ZIP saved to:\n{save_path}\n\n"
-                    f"Assets: {package.manifest['asset_count']}\n"
-                    f"Patched archive files: {package.manifest['archive_file_count']}\n\n"
-                    "End users can extract the ZIP and run install.bat.",
-                )
-            self.accept()
-        except Exception as exc:
-            QMessageBox.critical(self, "Mesh Ship Error", str(exc))
-        finally:
-            self._generate_btn.setEnabled(True)
-            self._progress.setVisible(False)
+            worker.report_progress(100, "Mesh package ready.")
+            return {
+                "save_path": save_path,
+                "package": package,
+                "package_mode": package_mode,
+            }
+
+        worker = FunctionWorker(task)
+        worker.progress.connect(self._on_progress)
+        worker.finished_result.connect(self._on_build_finished)
+        worker.error_occurred.connect(self._on_build_error)
+        self._build_worker = worker
+        worker.start()
+
+    def _on_build_finished(self, result: dict) -> None:
+        """Slot — ZIP build completed successfully."""
+        self._build_worker = None
+        self._generate_btn.setEnabled(True)
+        self._progress.setValue(100)
+        self._status.setText("Mesh package ready.")
+
+        save_path = result["save_path"]
+        package = result["package"]
+        package_mode = result["package_mode"]
+
+        if package_mode == "manager":
+            QMessageBox.information(
+                self,
+                "Done",
+                f"ZIP saved to:\n{save_path}\n\n"
+                f"Assets: {package.manifest['asset_count']}\n"
+                f"Loose files: {package.manifest['file_count']}\n\n"
+                "Import this ZIP into CDUMM, Crimson Browser, or another loose-file aware mod manager.",
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Done",
+                f"ZIP saved to:\n{save_path}\n\n"
+                f"Assets: {package.manifest['asset_count']}\n"
+                f"Patched archive files: {package.manifest['archive_file_count']}\n\n"
+                "End users can extract the ZIP and run install.bat.",
+            )
+        self._progress.setVisible(False)
+        self.accept()
+
+    def _on_build_error(self, error_msg: str) -> None:
+        """Slot — worker raised. Surface the error + re-enable the button."""
+        self._build_worker = None
+        self._generate_btn.setEnabled(True)
+        self._progress.setVisible(False)
+        self._status.setText("Mesh package failed.")
+        QMessageBox.critical(self, "Mesh Ship Error", error_msg)
 
     def _on_progress(self, pct: int, message: str) -> None:
         self._progress.setValue(max(0, min(100, pct)))
         self._status.setText(message)
+
+    def reject(self) -> None:
+        """Guard against closing while a worker is still running."""
+        if self._build_worker is not None and self._build_worker.isRunning():
+            self._build_worker.request_cancel()
+            self._build_worker.wait(3000)
+        super().reject()

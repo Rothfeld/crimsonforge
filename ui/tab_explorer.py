@@ -1360,25 +1360,70 @@ class ExplorerTab(QWidget):
             clean_path = entry.path.replace("\\", "/")
             basename = os.path.splitext(clean_path)[0].replace("/", "_")
 
-            # Try to find matching skeleton (.pab) for PAC files
+            # Try to find matching skeleton (.pab) for PAC files.
+            # Strategy: prefer the exact sibling path (cd_foo.pab next to
+            # cd_foo.pac), then fall back to basename match across every
+            # loaded PAMT. Skinned PACs (cd_phm_*, cd_phw_*, etc.) ship
+            # their skeleton in the SAME group, so the sibling hit is the
+            # common case; the basename fallback catches assets where the
+            # .pab lives in a different subdirectory of the group.
             skeleton = None
             bone_count = 0
+            pab_search_attempted = False
+            pab_search_reason = ""
             if entry.path.lower().endswith(".pac") and fmt == "fbx":
-                pab_path = entry.path.replace(".pac", ".pab")
-                # Search all loaded PAMTs for matching .pab
+                pab_search_attempted = True
+                pab_sibling_path = entry.path[:-4] + ".pab"   # .pac -> .pab
+                pab_basename = os.path.basename(pab_sibling_path).lower()
+                from core.pamt_parser import find_file_entry
+                from core.skeleton_parser import parse_pab
+
+                def _try_load_pab(pab_entry, source_path):
+                    nonlocal skeleton, bone_count, pab_search_reason
+                    try:
+                        pab_data = self._vfs.read_entry_data(pab_entry)
+                    except Exception as e:
+                        pab_search_reason = f"read failed for {source_path}: {e}"
+                        return False
+                    if not pab_data or pab_data[:4] != b"PAR ":
+                        pab_search_reason = f"{source_path} is not a PAR file"
+                        return False
+                    try:
+                        parsed = parse_pab(pab_data, source_path)
+                    except Exception as e:
+                        pab_search_reason = f"parse failed for {source_path}: {e}"
+                        return False
+                    if not parsed.bones:
+                        pab_search_reason = f"{source_path} has zero bones"
+                        return False
+                    skeleton = parsed
+                    bone_count = len(parsed.bones)
+                    return True
+
+                # Pass 1 — exact sibling path in every loaded PAMT.
                 for _g, pamt_data in self._vfs._pamt_cache.items():
-                    from core.pamt_parser import find_file_entry
-                    pab_entry = find_file_entry(pamt_data, pab_path)
-                    if pab_entry:
-                        try:
-                            from core.skeleton_parser import parse_pab
-                            pab_data = self._vfs.read_entry_data(pab_entry)
-                            if pab_data[:4] == b"PAR ":
-                                skeleton = parse_pab(pab_data, pab_path)
-                                bone_count = len(skeleton.bones)
-                        except Exception:
-                            pass
+                    pab_entry = find_file_entry(pamt_data, pab_sibling_path)
+                    if pab_entry and _try_load_pab(pab_entry, pab_sibling_path):
                         break
+
+                # Pass 2 — basename match anywhere (different subdir).
+                if skeleton is None:
+                    for _g, pamt_data in self._vfs._pamt_cache.items():
+                        for file_entry in pamt_data.file_entries:
+                            if os.path.basename(file_entry.path).lower() == pab_basename:
+                                if _try_load_pab(file_entry, file_entry.path):
+                                    break
+                        if skeleton is not None:
+                            break
+
+                # Pass 3 — no exact-name hit; fallback is silent-mesh-only.
+                # We set a reason string so the user sees WHY the armature
+                # is missing instead of a silent mesh-only export.
+                if skeleton is None and not pab_search_reason:
+                    pab_search_reason = (
+                        f"No {pab_basename!r} found in any loaded PAMT. "
+                        "Make sure the skeleton archive is loaded before export."
+                    )
 
             if fmt == "obj":
                 from core.mesh_exporter import export_obj
@@ -1393,10 +1438,28 @@ class ExplorerTab(QWidget):
                     f"Exported FBX: {mesh.total_vertices:,} verts, {mesh.total_faces:,} faces, {bone_count} bones"
                 )
             else:
+                # Mesh-only FBX. For PAC inputs, surface a confirmation so
+                # the user isn't surprised by an armature-less export.
+                if pab_search_attempted:
+                    from ui.dialogs.confirmation import confirm_action
+                    proceed = confirm_action(
+                        self,
+                        "Skeleton not found",
+                        (
+                            f"No matching .pab skeleton could be loaded for "
+                            f"{os.path.basename(entry.path)}.\n\n"
+                            f"Reason: {pab_search_reason}\n\n"
+                            "Continue with a mesh-only FBX export (no armature, "
+                            "no skin weights)?"
+                        ),
+                    )
+                    if not proceed:
+                        self._progress.set_status("Export cancelled — skeleton missing.")
+                        return
                 from core.mesh_exporter import export_fbx
                 export_fbx(mesh, output_dir, basename)
                 self._progress.set_status(
-                    f"Exported FBX: {mesh.total_vertices:,} verts, {mesh.total_faces:,} faces"
+                    f"Exported FBX (mesh-only): {mesh.total_vertices:,} verts, {mesh.total_faces:,} faces"
                 )
 
             from ui.dialogs.confirmation import show_info

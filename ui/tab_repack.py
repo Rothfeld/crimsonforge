@@ -36,10 +36,14 @@ class RepackTab(QWidget):
     def _setup_ui(self):
         layout = QVBoxLayout(self)
 
+        # Pre-fill the source path from the last-used value so the tab
+        # shows something meaningful on first render rather than a bare
+        # placeholder. The user can still browse to a different dir.
         src_row = QHBoxLayout()
         src_row.addWidget(QLabel("Modified Files:"))
-        self._source_path = QLineEdit()
+        self._source_path = QLineEdit(self._config.get("repack.source_dir", ""))
         self._source_path.setPlaceholderText("Directory containing modified files to repack...")
+        self._source_path.editingFinished.connect(self._on_source_path_changed)
         src_row.addWidget(self._source_path, 1)
         src_browse = QPushButton("Browse...")
         src_browse.clicked.connect(self._browse_source)
@@ -55,6 +59,14 @@ class RepackTab(QWidget):
         bk_browse.clicked.connect(self._browse_backup)
         backup_row.addWidget(bk_browse)
         layout.addLayout(backup_row)
+
+        # Header-level hint — the file tree is empty until we have both
+        # a source dir and a game dir to scan against. The hint gives
+        # the user a clear next step instead of a blank tree.
+        self._hint = QLabel("")
+        self._hint.setWordWrap(True)
+        self._hint.setStyleSheet("color: #a6adc8; padding: 4px;")
+        layout.addWidget(self._hint)
 
         self._file_tree = QTreeWidget()
         self._file_tree.setHeaderLabels(["", "File", "Size", "Target PAZ", "Status"])
@@ -105,33 +117,113 @@ class RepackTab(QWidget):
         layout.addWidget(self._progress)
 
     def initialize_from_game(self, packages_path: str) -> None:
-        """Called by main_window after game is loaded."""
+        """Populate the tab once the game is loaded.
+
+        Called by ``MainWindow`` via the lazy-tab background-init flow.
+        Previously this just stashed the game path and left the tab
+        looking blank — users reported "Repack tab is empty". We now:
+
+          1. Store the game path so Repack has somewhere to write.
+          2. Read the last-used Modified Files directory from config.
+          3. If that directory is valid, auto-scan it so the user sees
+             their mod files immediately instead of a bare tree.
+          4. If nothing is configured, show a clear next-step hint.
+
+        This runs on a background thread via FunctionWorker, so disk
+        I/O in step 3 doesn't block the UI paint that surfaces the
+        overlay.
+        """
         self._game_path = packages_path
+        source_dir = self._source_path.text().strip()
+        if source_dir and os.path.isdir(source_dir):
+            # Auto-scan the saved directory so the tab shows data the
+            # moment it becomes visible.
+            self._scan_files(notify_if_empty=False)
+            self._refresh_hint()
+        else:
+            self._refresh_hint()
 
     def set_game_path(self, path: str):
         """Backward compat alias."""
         self._game_path = path
 
+    def _refresh_hint(self) -> None:
+        """Update the header hint label to reflect the current state."""
+        src = self._source_path.text().strip()
+        if not self._game_path:
+            self._hint.setText(
+                "Game not loaded. Return to Game Setup and pick your "
+                "Crimson Desert packages/ directory before repacking."
+            )
+            return
+        if not src:
+            self._hint.setText(
+                "Click Browse to pick a folder containing modified .pac/"
+                ".pam/.paloc/etc. files, then Scan Modified Files. Files "
+                "must keep their original names so they can be matched "
+                "back into the game archives."
+            )
+            return
+        if not os.path.isdir(src):
+            self._hint.setText(
+                f"Modified files directory does not exist: {src}"
+            )
+            return
+        count = self._file_tree.topLevelItemCount()
+        if count == 0:
+            self._hint.setText(
+                f"Source: {src}\nClick Scan Modified Files to populate the list."
+            )
+        else:
+            self._hint.setText(
+                f"Source: {src}\n{count} file(s) ready — tick the ones "
+                "you want to repack, then click Repack Selected."
+            )
+
+    def _on_source_path_changed(self) -> None:
+        path = self._source_path.text().strip()
+        if path:
+            self._config.set("repack.source_dir", path)
+            self._config.save()
+        self._refresh_hint()
+
     def _browse_source(self):
         path = pick_directory(self, "Select Modified Files Directory")
         if path:
             self._source_path.setText(path)
+            self._config.set("repack.source_dir", path)
+            self._config.save()
+            self._refresh_hint()
 
     def _browse_backup(self):
         path = pick_directory(self, "Select Backup Directory")
         if path:
             self._backup_path.setText(path)
+            self._config.set("repack.backup_dir", path)
+            self._config.save()
 
-    def _scan_files(self):
+    def _scan_files(self, notify_if_empty: bool = True):
+        """Walk the Modified Files directory and populate the tree.
+
+        ``notify_if_empty`` controls whether we surface a popup when the
+        directory is invalid or empty. Auto-scan on tab init passes
+        ``False`` so a missing directory doesn't spam a dialog on
+        every launch.
+        """
         src = self._source_path.text().strip()
         if not src or not os.path.isdir(src):
-            show_error(self, "Error", "Select a valid directory with modified files.")
+            if notify_if_empty:
+                show_error(self, "Error", "Select a valid directory with modified files.")
+            self._refresh_hint()
             return
         self._file_tree.clear()
         for root, dirs, files in os.walk(src):
             for fname in files:
                 fpath = os.path.join(root, fname)
-                size = os.path.getsize(fpath)
+                try:
+                    size = os.path.getsize(fpath)
+                except OSError:
+                    continue
                 item = QTreeWidgetItem()
                 item.setCheckState(0, Qt.Checked)
                 item.setText(1, os.path.relpath(fpath, src))
@@ -140,7 +232,9 @@ class RepackTab(QWidget):
                 item.setText(4, "Ready")
                 item.setData(0, Qt.UserRole, fpath)
                 self._file_tree.addTopLevelItem(item)
-        self._progress.set_status(f"Found {self._file_tree.topLevelItemCount()} files")
+        count = self._file_tree.topLevelItemCount()
+        self._progress.set_status(f"Found {count} files")
+        self._refresh_hint()
 
     def _repack(self):
         if not self._game_path or not os.path.isdir(self._game_path):
