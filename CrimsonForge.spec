@@ -122,7 +122,13 @@ a = Analysis(
         'openai',
         'anthropic',
         'google.genai',
+        'google.genai.types',
         'cohere',
+        # DeepL is imported lazily inside provider_deepl.translate()
+        # so PyInstaller's static analyser can't see it — without
+        # this line the frozen exe shows "DeepL SDK not installed"
+        # at runtime even though deepl is in requirements.txt.
+        'deepl',
         'PySide6.QtMultimedia',
         'PySide6.QtMultimediaWidgets',
     ],
