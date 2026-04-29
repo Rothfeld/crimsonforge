@@ -215,6 +215,54 @@ def _write_mtl(path, submeshes):
 #  FBX BINARY 7.4 EXPORTER
 # ═══════════════════════════════════════════════════════════════════════
 
+def _lcl_from_bind_matrix(m, scale: float = 1.0):
+    """Decompose an FBX row-major bind matrix into Lcl TRS components.
+
+    FBX row-major row-vector convention: rows 0-2 are the bone's local X/Y/Z
+    axes in world space; row 3 is the world translation [tx, ty, tz, 1].
+
+    Returns (tx, ty, tz, rx_deg, ry_deg, rz_deg, sx, sy, sz) where the
+    rotation is XYZ Euler in degrees — the same convention FBX Lcl Rotation
+    uses by default.  Setting these on the bone Model node makes the bone's
+    frame-0 world matrix equal TransformLink, so the skin modifier sees no
+    deformation at bind pose.
+    """
+    import math
+
+    tx, ty, tz = float(m[12]) * scale, float(m[13]) * scale, float(m[14]) * scale
+
+    # Row-vector 3×3: each row is a local axis direction in world space.
+    r = [[float(m[r_*4+c]) for c in range(3)] for r_ in range(3)]
+
+    sx = math.sqrt(sum(v*v for v in r[0])) or 1.0
+    sy = math.sqrt(sum(v*v for v in r[1])) or 1.0
+    sz = math.sqrt(sum(v*v for v in r[2])) or 1.0
+
+    # Normalise rows to get pure rotation.
+    for i, s_ in enumerate((sx, sy, sz)):
+        r[i] = [v / s_ for v in r[i]]
+
+    # XYZ Euler decomposition for M = Rx(α) @ Ry(β) @ Rz(γ) (row-major right-multiply):
+    #   M[0][2] = -sin(β)
+    #   M[1][2] =  sin(α) cos(β)
+    #   M[2][2] =  cos(α) cos(β)
+    #   M[0][1] =  cos(β) sin(γ)
+    #   M[0][0] =  cos(β) cos(γ)
+    r02 = max(-1.0, min(1.0, r[0][2]))
+    beta  = math.asin(-r02)
+    cb    = math.cos(beta)
+    if abs(cb) > 1e-6:
+        alpha = math.atan2( r[1][2] / cb, r[2][2] / cb)
+        gamma = math.atan2( r[0][1] / cb, r[0][0] / cb)
+    else:
+        alpha = math.atan2(-r[2][1], r[1][1])
+        gamma = 0.0
+
+    return (tx, ty, tz,
+            math.degrees(alpha), math.degrees(beta), math.degrees(gamma),
+            sx, sy, sz)
+
+
 class _FbxId:
     """Wrapper for FBX unique IDs (always int64)."""
     def __init__(self, val): self.val = val
@@ -346,7 +394,7 @@ def export_fbx(mesh: ParsedMesh, output_dir: str, name: str = "",
             W(b2, "P", ["FrontAxisSign", "int", "Integer", "", 1])
             W(b2, "P", ["CoordAxis", "int", "Integer", "", 0])
             W(b2, "P", ["CoordAxisSign", "int", "Integer", "", 1])
-            W(b2, "P", ["UnitScaleFactor", "double", "Number", "", 1.0])
+            W(b2, "P", ["UnitScaleFactor", "double", "Number", "", 100.0])
         W(b, "Properties70", children=[props70])
     W(buf, "GlobalSettings", children=[global_settings])
 
@@ -358,8 +406,6 @@ def export_fbx(mesh: ParsedMesh, output_dir: str, name: str = "",
         mesh_ids.append(uid())
         model_ids.append(uid())
         mat_ids.append(uid())
-
-    root_id = uid()
 
     # Objects
     def objects(b):
@@ -382,13 +428,10 @@ def export_fbx(mesh: ParsedMesh, output_dir: str, name: str = "",
                 normals_flat.extend([nx, ny, nz])
 
             uvs_flat = []
-            uv_indices = []
-            for i_v, (u, v) in enumerate(sm.uvs):
+            for u, v in sm.uvs:
                 uvs_flat.extend([u, 1.0 - v])
-                uv_indices.append(i_v)
 
-            def geom_node(b2, vf=verts_flat, iff=indices_flat, nf=normals_flat,
-                          uf=uvs_flat, ui=uv_indices, sm_ref=sm, m=mid):
+            def geom_node(b2, vf=verts_flat, iff=indices_flat, nf=normals_flat, uf=uvs_flat):
                 def layer_elem_normal(b3, nf_=nf):
                     W(b3, "Version", [101])
                     W(b3, "Name", [""])
@@ -396,7 +439,7 @@ def export_fbx(mesh: ParsedMesh, output_dir: str, name: str = "",
                     W(b3, "ReferenceInformationType", ["Direct"])
                     W(b3, "Normals", [nf_])
 
-                def layer_elem_uv(b3, uf_=uf, ui_=ui):
+                def layer_elem_uv(b3, uf_=uf):
                     W(b3, "Version", [101])
                     W(b3, "Name", ["UVMap"])
                     W(b3, "MappingInformationType", ["ByVertice"])
@@ -405,12 +448,10 @@ def export_fbx(mesh: ParsedMesh, output_dir: str, name: str = "",
 
                 def layer0(b3):
                     W(b3, "Version", [100])
-
                     def le_normal(b4):
                         W(b4, "Type", ["LayerElementNormal"])
                         W(b4, "TypedIndex", [0])
                     W(b3, "LayerElement", children=[le_normal])
-
                     if uf:
                         def le_uv(b4):
                             W(b4, "Type", ["LayerElementUV"])
@@ -419,7 +460,6 @@ def export_fbx(mesh: ParsedMesh, output_dir: str, name: str = "",
 
                 W(b2, "Vertices", [vf])
                 W(b2, "PolygonVertexIndex", [iff])
-
                 if nf:
                     W(b2, "LayerElementNormal", [0], children=[layer_elem_normal])
                 if uf:
@@ -432,13 +472,11 @@ def export_fbx(mesh: ParsedMesh, output_dir: str, name: str = "",
             # Model node
             def model_node(b2):
                 W(b2, "Version", [232])
-
                 def props(b3):
                     W(b3, "P", ["Lcl Translation", "Lcl Translation", "", "A", 0.0, 0.0, 0.0])
-                    W(b3, "P", ["Lcl Rotation", "Lcl Rotation", "", "A", 0.0, 0.0, 0.0])
-                    W(b3, "P", ["Lcl Scaling", "Lcl Scaling", "", "A", 1.0, 1.0, 1.0])
+                    W(b3, "P", ["Lcl Rotation",    "Lcl Rotation",    "", "A", 0.0, 0.0, 0.0])
+                    W(b3, "P", ["Lcl Scaling",     "Lcl Scaling",     "", "A", 1.0, 1.0, 1.0])
                 W(b2, "Properties70", children=[props])
-
             W(b, "Model", [mod_id, f"{sm.name}\x00\x01Model", "Mesh"],
               children=[model_node])
 
@@ -446,11 +484,9 @@ def export_fbx(mesh: ParsedMesh, output_dir: str, name: str = "",
             def mat_node(b2):
                 W(b2, "Version", [102])
                 W(b2, "ShadingModel", ["phong"])
-
                 def mat_props(b3):
                     W(b3, "P", ["DiffuseColor", "Color", "", "A", 0.8, 0.8, 0.8])
                 W(b2, "Properties70", children=[mat_props])
-
             W(b, "Material", [ma_id, f"{sm.material or sm.name}\x00\x01Material", ""],
               children=[mat_node])
 
@@ -459,11 +495,8 @@ def export_fbx(mesh: ParsedMesh, output_dir: str, name: str = "",
     # Connections
     def connections(b):
         for idx in range(len(mesh.submeshes)):
-            # Model → Root
             W(b, "C", ["OO", model_ids[idx], _FbxId(0)])
-            # Geometry → Model
             W(b, "C", ["OO", mesh_ids[idx], model_ids[idx]])
-            # Material → Model
             W(b, "C", ["OO", mat_ids[idx], model_ids[idx]])
 
     W(buf, "Connections", children=[connections])
@@ -532,7 +565,7 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
             W(b2, "P", ["FrontAxisSign", "int", "Integer", "", 1])
             W(b2, "P", ["CoordAxis", "int", "Integer", "", 0])
             W(b2, "P", ["CoordAxisSign", "int", "Integer", "", 1])
-            W(b2, "P", ["UnitScaleFactor", "double", "Number", "", 1.0])
+            W(b2, "P", ["UnitScaleFactor", "double", "Number", "", 100.0])
         W(b, "Properties70", children=[props70])
     W(buf, "GlobalSettings", children=[global_settings])
 
@@ -551,6 +584,7 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
             bone_attr_ids[bone.index] = uid()
 
     root_id = uid()
+    pose_id = uid()
 
     # Precompute skinning data per submesh.
     # For each submesh, we collect the set of (bone_index, [(vertex_idx, weight), ...])
@@ -646,14 +680,31 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
                     f"{bone.name}\x00\x01NodeAttribute", "LimbNode"],
                     children=[bone_attr])
 
-                # Model for bone
+                # Model for bone.
+                # Lcl Translation + Lcl Rotation are derived from bind_matrix so
+                # that the bone's frame-0 pose == its bind pose.  Without this the
+                # bone sits at origin while TransformLink says it was somewhere else,
+                # and the skin modifier computes the full bind→current delta as
+                # deformation — the "spiky explosion."
                 def bone_model(b2, bn=bone):
                     W(b2, "Version", [232])
                     def props(b3, _bn=bn):
+                        bm = getattr(_bn, "bind_matrix", None)
+                        if bm and len(bm) == 16:
+                            tx, ty, tz, rx, ry, rz, sx, sy, sz = \
+                                _lcl_from_bind_matrix(bm, scale)
+                        else:
+                            tx = float(_bn.position[0] * scale)
+                            ty = float(_bn.position[1] * scale)
+                            tz = float(_bn.position[2] * scale)
+                            rx = ry = rz = 0.0
+                            sx = sy = sz = 1.0
                         W(b3, "P", ["Lcl Translation", "Lcl Translation", "", "A",
-                                    float(_bn.position[0] * scale),
-                                    float(_bn.position[1] * scale),
-                                    float(_bn.position[2] * scale)])
+                                    tx, ty, tz])
+                        W(b3, "P", ["Lcl Rotation",    "Lcl Rotation",    "", "A",
+                                    rx, ry, rz])
+                        W(b3, "P", ["Lcl Scaling",     "Lcl Scaling",     "", "A",
+                                    sx, sy, sz])
                     W(b2, "Properties70", children=[props])
 
                 W(b, "Model", [bone_model_ids[bone.index],
@@ -676,19 +727,16 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
             """Return (Transform, TransformLink) for an FBX Cluster.
 
             FBX Cluster semantics:
-              TransformLink = bone's world-space bind pose (4x4, column-major)
-              Transform     = inverse of TransformLink in geometry space
-
-            The skeleton parser exposes these as ``bone.bind_matrix`` and
-            ``bone.inv_bind_matrix``; when they're populated we use them
-            verbatim. Missing data falls back to identity which Blender
-            treats as "rest pose at origin" — the mesh imports with
-            weights intact, just without a custom bind pose.
+              Transform     = mesh world matrix at bind time.  The mesh sits
+                              at the world origin, so this is always identity.
+                              (Writing inv_bind_matrix here is wrong: it gets
+                              applied a second time inside the skinning formula
+                              M_current × inv(TransformLink) × Transform,
+                              producing M_current × inv(TL)² instead of
+                              M_current × inv(TL) — causes the spiky explosion.)
+              TransformLink = bone world matrix at bind time (= bind_matrix).
             """
-            if getattr(bone, "inv_bind_matrix", None) and len(bone.inv_bind_matrix) == 16:
-                transform = [float(v) for v in bone.inv_bind_matrix]
-            else:
-                transform = list(identity_matrix)
+            transform = list(identity_matrix)
             if getattr(bone, "bind_matrix", None) and len(bone.bind_matrix) == 16:
                 link = [float(v) for v in bone.bind_matrix]
             else:
@@ -728,6 +776,27 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
                   [cl_id, f"{bone.name}_{sm.name}\x00\x01SubDeformer", "Cluster"],
                   children=[cluster_node])
 
+        # BindPose — tells Blender that each bone's world matrix at bind time
+        # equals its TransformLink.  Without this, Blender positions bones using
+        # only Lcl Translation (no rotation exported), so M_pose ≠ TransformLink
+        # at frame 0 and the skin deformer produces the "spiky explosion".
+        # With BindPose present, Blender overrides each bone's rest-pose to the
+        # BindPose value, making M_pose_frame0 = TransformLink → no deformation.
+        if skeleton and skeleton.bones:
+            bones_with_link = [(bone, _bone_bind_matrices(bone)[1])
+                               for bone in skeleton.bones]
+            def pose_body(b2, bwl=bones_with_link):
+                W(b2, "Type", ["BindPose"])
+                W(b2, "Version", [100])
+                W(b2, "NbPoseNodes", [len(bwl)])
+                for _bone, _link in bwl:
+                    def pn(b3, bid=bone_model_ids[_bone.index], mat=_link):
+                        W(b3, "Node", [bid])
+                        W(b3, "Matrix", [mat])
+                    W(b2, "PoseNode", children=[pn])
+            W(b, "Pose", [pose_id, "BindPose\x00\x01Pose", "BindPose"],
+              children=[pose_body])
+
     W(buf, "Objects", children=[objects])
 
     # Connections
@@ -737,17 +806,22 @@ def export_fbx_with_skeleton(mesh: ParsedMesh, skeleton, output_dir: str,
             W(b, "C", ["OO", mesh_ids[idx], model_ids[idx]])
             W(b, "C", ["OO", mat_ids[idx], model_ids[idx]])
 
+        # BindPose → root
+        if skeleton and skeleton.bones:
+            W(b, "C", ["OO", pose_id, _FbxId(0)])
+
         # Bone connections
         if skeleton and skeleton.bones:
             for bone in skeleton.bones:
                 # NodeAttribute → Bone Model
                 W(b, "C", ["OO", bone_attr_ids[bone.index], bone_model_ids[bone.index]])
-                # Bone → Parent (or root)
-                if bone.parent_index >= 0 and bone.parent_index in bone_model_ids:
-                    W(b, "C", ["OO", bone_model_ids[bone.index],
-                               bone_model_ids[bone.parent_index]])
-                else:
-                    W(b, "C", ["OO", bone_model_ids[bone.index], _FbxId(0)])
+                # All bones parent to root (flat armature).
+                # Lcl Translation/Rotation on each bone is the WORLD bind matrix
+                # decomposed directly.  If we used the real parent-child hierarchy
+                # Blender would compound the parent's transform on top of the
+                # child's already-world-space Lcl TRS, putting bones in wrong
+                # positions and causing the "spiky explosion" at bind pose.
+                W(b, "C", ["OO", bone_model_ids[bone.index], _FbxId(0)])
 
         # Skin + Cluster connections. Connection topology per submesh:
         #

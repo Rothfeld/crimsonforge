@@ -271,10 +271,16 @@ def _prepare_mesh_assets(
 
     for req in normalized_requests:
         current_step += 1
-        report(f"Rebuilding {os.path.basename(req.entry.path)} from OBJ...")
+        ext = os.path.splitext(req.obj_path)[1].lower()
+        fmt_label = "FBX" if ext == ".fbx" else "OBJ"
+        report(f"Rebuilding {os.path.basename(req.entry.path)} from {fmt_label}...")
 
         original_data = vfs.read_entry_data(req.entry)
-        imported = import_obj(req.obj_path)
+        if ext == ".fbx":
+            from core.mesh_importer import import_fbx
+            imported = import_fbx(req.obj_path)
+        else:
+            imported = import_obj(req.obj_path)
         imported.path = req.entry.path
         imported.format = _entry_format(req.entry)
         rebuilt_data = build_mesh(imported, original_data)

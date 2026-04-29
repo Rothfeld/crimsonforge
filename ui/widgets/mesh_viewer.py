@@ -550,11 +550,10 @@ out vec2 vUV;
 void main() {
     vNormal = aNormal;
     vColor = aColor;
-    // The game's OBJ convention puts v=0 at the bottom, but we upload
-    // the decoded DDS in DDS-native order (row 0 at the top). Flip here
-    // so the shader reads the texture upright without a second CPU-side
-    // pass over every UV.
-    vUV = vec2(aUV.x, 1.0 - aUV.y);
+    // DDS row 0 (top of image) is uploaded as-is; glTexImage2D maps the first
+    // byte to t=0 (OpenGL bottom-left), so the DX v=0-at-top convention and
+    // the OpenGL bottom-origin cancel each other out. No flip needed.
+    vUV = aUV;
     gl_Position = uMVP * vec4(aPos, 1.0);
 }
 """

@@ -1,10 +1,11 @@
-"""OBJ importer and PAC/PAM binary builder for round-trip mesh modding.
+"""OBJ / FBX importer and PAC/PAM binary builder for round-trip mesh modding.
 
-Pipeline: Export .pac → edit in Blender → save .obj → import_obj() → build_pac() → repack
+Pipeline: Export .pac → edit in Blender → save .obj/.fbx → import_obj/import_fbx()
+          → build_pac() → repack
 
-The OBJ file must have been exported by CrimsonForge (contains source_path
-and source_format comments). The original PAC/PAM binary is needed to
-preserve metadata (names, materials, bones, flags) that OBJ cannot store.
+The OBJ/FBX must have been exported by CrimsonForge so the .cfmeta.json sidecar
+is present alongside it. The original PAC/PAM binary is needed to preserve
+metadata (names, materials, bones, flags) that OBJ/FBX cannot store.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import copy
 import os
 import struct
 import math
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -415,6 +417,508 @@ def import_obj(obj_path: str) -> ParsedMesh:
 
     logger.info("Imported OBJ %s: %d submeshes, %d verts, %d faces, source=%s (%s)",
                 obj_path, len(submeshes), result.total_vertices,
+                result.total_faces, source_path, source_format)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  FBX BINARY PARSER
+# ═══════════════════════════════════════════════════════════════════════
+
+def _fbx_read_prop(data: bytes, pos: int) -> tuple:
+    """Parse one FBX property, return (value, new_pos)."""
+    t = chr(data[pos])
+    pos += 1
+    if t == 'Y':
+        v, = struct.unpack_from('<h', data, pos)
+        return v, pos + 2
+    if t in ('C', 'B'):
+        return bool(data[pos]), pos + 1
+    if t == 'I':
+        v, = struct.unpack_from('<i', data, pos)
+        return v, pos + 4
+    if t == 'F':
+        v, = struct.unpack_from('<f', data, pos)
+        return v, pos + 4
+    if t == 'D':
+        v, = struct.unpack_from('<d', data, pos)
+        return v, pos + 8
+    if t == 'L':
+        v, = struct.unpack_from('<q', data, pos)
+        return v, pos + 8
+    if t in ('f', 'd', 'l', 'i', 'b'):
+        count, enc, clen = struct.unpack_from('<III', data, pos)
+        raw = data[pos + 12: pos + 12 + clen]
+        if enc:
+            raw = zlib.decompress(raw)
+        fmt = {'f': 'f', 'd': 'd', 'l': 'q', 'i': 'i', 'b': 'B'}[t]
+        return list(struct.unpack_from(f'<{count}{fmt}', raw)), pos + 12 + clen
+    if t == 'S':
+        slen, = struct.unpack_from('<I', data, pos)
+        return data[pos + 4: pos + 4 + slen].decode('utf-8', errors='replace'), pos + 4 + slen
+    if t == 'R':
+        rlen, = struct.unpack_from('<I', data, pos)
+        return data[pos + 4: pos + 4 + rlen], pos + 4 + rlen
+    raise ValueError(f"Unknown FBX property type {t!r} at {pos}")
+
+
+def _fbx_parse_nodes(data: bytes, pos: int, end: int, is_v75: bool) -> list[dict]:
+    """Recursively parse FBX binary nodes from pos to end."""
+    nodes: list[dict] = []
+    null_size = 25 if is_v75 else 13
+    off_fmt = '<Q' if is_v75 else '<I'
+    off_size = 8 if is_v75 else 4
+    hdr_size = 25 if is_v75 else 13  # 3×off + 1 name_len byte
+
+    while pos < end:
+        if pos + hdr_size > len(data):
+            break
+        node_end, = struct.unpack_from(off_fmt, data, pos)
+        if node_end == 0:
+            break  # null sentinel
+        if is_v75:
+            num_props, = struct.unpack_from('<Q', data, pos + 8)
+            prop_len, = struct.unpack_from('<Q', data, pos + 16)
+            name_len = data[pos + 24]
+        else:
+            num_props, = struct.unpack_from('<I', data, pos + 4)
+            prop_len, = struct.unpack_from('<I', data, pos + 8)
+            name_len = data[pos + 12]
+
+        name = data[pos + hdr_size: pos + hdr_size + name_len].decode('ascii', errors='replace')
+        prop_start = pos + hdr_size + name_len
+
+        props = []
+        p = prop_start
+        try:
+            for _ in range(num_props):
+                val, p = _fbx_read_prop(data, p)
+                props.append(val)
+        except Exception:
+            pass
+
+        children_start = prop_start + prop_len
+        children = _fbx_parse_nodes(data, children_start, node_end, is_v75)
+
+        nodes.append({'name': name, 'props': props, 'children': children})
+        pos = node_end
+
+    return nodes
+
+
+def _fbx_find(nodes: list[dict], name: str) -> dict | None:
+    for n in nodes:
+        if n['name'] == name:
+            return n
+    return None
+
+
+def _fbx_find_all(nodes: list[dict], name: str) -> list[dict]:
+    return [n for n in nodes if n['name'] == name]
+
+
+def _fbx_child_val(node: dict, child_name: str, default=None):
+    c = _fbx_find(node['children'], child_name)
+    return c['props'][0] if (c and c['props']) else default
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  FBX IMPORTER
+# ═══════════════════════════════════════════════════════════════════════
+
+def _apply_model_transform(
+    model_node: dict | None,
+    verts: list[tuple[float, float, float]],
+) -> list[tuple[float, float, float]]:
+    """Apply a Model node's Lcl Translation/Rotation/Scaling to vertex positions.
+
+    FBX vertices are stored in the mesh object's local space. When a user
+    moves or rotates a mesh object in Blender (rather than editing vertices in
+    Edit Mode), Blender stores the delta in Lcl Translation/Rotation and keeps
+    the Geometry vertices at their original local coordinates.
+
+    Blender bakes the original FBX UnitScaleFactor (e.g. 100 for cm) into the
+    object's Lcl Scaling on re-export. The vertices in the Geometry node are
+    already in game-space units (metres). The correct world-space formula that
+    preserves the original unit scale is:
+
+        V_world = R(V_local) + T / S
+
+    where S is the (assumed uniform) Lcl Scaling factor. Dividing T by S
+    converts the translation from Blender's scaled unit back to game-space
+    metres before adding it.
+
+    For meshes exported from CrimsonForge, Lcl Translation and Rotation are
+    zero, so this is always a no-op for the standard round-trip.
+    """
+    import math as _math
+
+    if model_node is None:
+        return verts
+
+    p70 = _fbx_find(model_node['children'], 'Properties70')
+    if p70 is None:
+        return verts
+
+    tx = ty = tz = 0.0
+    rx = ry = rz = 0.0
+    sx = sy = sz = 1.0
+
+    for p in _fbx_find_all(p70['children'], 'P'):
+        if not p['props']:
+            continue
+        name = p['props'][0]
+        if name == 'Lcl Translation' and len(p['props']) >= 7:
+            tx, ty, tz = float(p['props'][4]), float(p['props'][5]), float(p['props'][6])
+        elif name == 'Lcl Rotation' and len(p['props']) >= 7:
+            rx, ry, rz = float(p['props'][4]), float(p['props'][5]), float(p['props'][6])
+        elif name == 'Lcl Scaling' and len(p['props']) >= 7:
+            sx, sy, sz = float(p['props'][4]), float(p['props'][5]), float(p['props'][6])
+
+    no_translation = abs(tx) < 1e-8 and abs(ty) < 1e-8 and abs(tz) < 1e-8
+    no_rotation    = abs(rx) < 1e-8 and abs(ry) < 1e-8 and abs(rz) < 1e-8
+    if no_translation and no_rotation:
+        return verts
+
+    # Build rotation matrix from Euler XYZ angles (degrees).
+    rx_r = _math.radians(rx)
+    ry_r = _math.radians(ry)
+    rz_r = _math.radians(rz)
+
+    cx, sx_ = _math.cos(rx_r), _math.sin(rx_r)
+    cy, sy_ = _math.cos(ry_r), _math.sin(ry_r)
+    cz, sz_ = _math.cos(rz_r), _math.sin(rz_r)
+
+    # R = Rz * Ry * Rx (FBX Euler XYZ order)
+    r00 =  cy * cz;  r01 = cz * sx_ * sy_ - cx * sz_;  r02 = cx * cz * sy_ + sx_ * sz_
+    r10 =  cy * sz_;  r11 = cx * cz + sx_ * sy_ * sz_;  r12 = -cz * sx_ + cx * sy_ * sz_
+    r20 = -sy_;       r21 = cy * sx_;                    r22 = cy * cx
+
+    # Blender bakes UnitScaleFactor into Lcl Scaling. Dividing T by S converts
+    # the translation back to game-space units (same as the Geometry vertices).
+    # Lcl Scaling is assumed uniform; use sx as the representative factor.
+    s = sx if abs(sx) > 1e-8 else 1.0
+    ttx, tty, ttz = tx / s, ty / s, tz / s
+
+    out: list[tuple[float, float, float]] = []
+    for x, y, z in verts:
+        xr = r00 * x + r01 * y + r02 * z + ttx
+        yr = r10 * x + r11 * y + r12 * z + tty
+        zr = r20 * x + r21 * y + r22 * z + ttz
+        out.append((xr, yr, zr))
+    return out
+
+
+def import_fbx(fbx_path: str) -> ParsedMesh:
+    """Import a Blender-exported binary FBX into a ParsedMesh.
+
+    Supports FBX binary 7.4 (32-bit offsets) and 7.5 (64-bit offsets).
+    Loads the .cfmeta.json sidecar for bone data and source_vertex_map,
+    identical to import_obj. UV-seam splitting uses the same vertex
+    cloning logic so build_pac receives a correctly mapped mesh.
+
+    Handles:
+    - LayerElementNormal: ByPolygonVertex/Direct and ByVertice/Direct
+    - LayerElementUV: ByPolygonVertex/IndexToDirect and ByPolygonVertex/Direct
+    - Polygon triangulation by fan (handles quads and ngons from Blender)
+    """
+    data = Path(fbx_path).read_bytes()
+
+    if data[:21] != b"Kaydara FBX Binary  \x00":
+        raise ValueError(f"Not a binary FBX file: {fbx_path}")
+
+    version = struct.unpack_from('<I', data, 23)[0]
+    is_v75 = version >= 7500
+
+    sidecar = _load_cfmeta_sidecar(fbx_path)
+
+    nodes = _fbx_parse_nodes(data, 27, len(data), is_v75)
+
+    objects = _fbx_find(nodes, 'Objects')
+    conns_node = _fbx_find(nodes, 'Connections')
+    if objects is None:
+        raise ValueError(f"FBX has no Objects section: {fbx_path}")
+
+    # geometry_id → node
+    geo_nodes: dict[int, dict] = {}
+    for n in _fbx_find_all(objects['children'], 'Geometry'):
+        if n['props'] and isinstance(n['props'][0], int):
+            geo_nodes[n['props'][0]] = n
+
+    # model_id → display name (strip FBX \x00\x01Type suffix)
+    model_names: dict[int, str] = {}
+    model_nodes: dict[int, dict] = {}
+    model_order: list[int] = []
+    for n in _fbx_find_all(objects['children'], 'Model'):
+        if n['props'] and isinstance(n['props'][0], int):
+            mid = n['props'][0]
+            raw = n['props'][1] if len(n['props']) > 1 and isinstance(n['props'][1], str) else ''
+            model_names[mid] = raw.split('\x00')[0]
+            model_nodes[mid] = n
+            model_order.append(mid)
+
+    # Skin / Cluster deformer nodes
+    skin_nodes: dict[int, dict] = {}
+    cluster_nodes: dict[int, dict] = {}
+    for n in _fbx_find_all(objects['children'], 'Deformer'):
+        if not (n['props'] and isinstance(n['props'][0], int)):
+            continue
+        did = n['props'][0]
+        dtype = n['props'][2] if len(n['props']) > 2 and isinstance(n['props'][2], str) else ''
+        if dtype == 'Skin':
+            skin_nodes[did] = n
+        elif dtype == 'Cluster':
+            cluster_nodes[did] = n
+
+    # Parse all OO connections in one pass
+    geo_to_model: dict[int, int] = {}
+    geo_to_skin: dict[int, int] = {}       # geo_id  → skin_id
+    cluster_to_skin: dict[int, int] = {}   # cluster_id → skin_id
+    cluster_to_bone: dict[int, int] = {}   # cluster_id → bone_model_id
+
+    if conns_node:
+        for c in _fbx_find_all(conns_node['children'], 'C'):
+            if len(c['props']) < 3 or c['props'][0] != 'OO':
+                continue
+            src, dst = c['props'][1], c['props'][2]
+            if not (isinstance(src, int) and isinstance(dst, int)):
+                continue
+            if src in geo_nodes and dst in model_names:
+                geo_to_model[src] = dst
+            elif src in skin_nodes and dst in geo_nodes:
+                geo_to_skin[dst] = src
+            elif src in cluster_nodes and dst in skin_nodes:
+                cluster_to_skin[src] = dst
+            elif src in model_names and dst in cluster_nodes:
+                cluster_to_bone[dst] = src
+
+    model_to_geo = {mid: gid for gid, mid in geo_to_model.items()}
+
+    # skin_id → [cluster_ids]
+    skin_to_clusters: dict[int, list[int]] = {}
+    for cid, sid in cluster_to_skin.items():
+        skin_to_clusters.setdefault(sid, []).append(cid)
+
+    # Bone names are stable across Blender re-exports; assign a consecutive
+    # index to each unique bone name so split-vertex inheritance works.
+    bone_name_to_idx: dict[str, int] = {}
+
+    def _geo_skin_weights(geo_id: int) -> dict[int, list[tuple[int, float]]]:
+        """Return vi → [(bone_idx, weight)] for the skin bound to geo_id."""
+        sid = geo_to_skin.get(geo_id)
+        if sid is None:
+            return {}
+        out: dict[int, list[tuple[int, float]]] = {}
+        for cid in skin_to_clusters.get(sid, []):
+            cn = cluster_nodes.get(cid)
+            if cn is None:
+                continue
+            bone_mid = cluster_to_bone.get(cid)
+            bone_name = model_names.get(bone_mid, f'_bone_{cid}') if bone_mid else f'_bone_{cid}'
+            if bone_name not in bone_name_to_idx:
+                bone_name_to_idx[bone_name] = len(bone_name_to_idx)
+            bidx = bone_name_to_idx[bone_name]
+            idx_n = _fbx_find(cn['children'], 'Indexes')
+            wt_n = _fbx_find(cn['children'], 'Weights')
+            if not (idx_n and wt_n and idx_n['props'] and wt_n['props']):
+                continue
+            for vi, w in zip(idx_n['props'][0], wt_n['props'][0]):
+                if isinstance(vi, int) and w > 0.0:
+                    out.setdefault(int(vi), []).append((bidx, float(w)))
+        return out
+
+    # source_path comes from the optional sidecar (FBX itself doesn't carry
+    # the game PAC path; build_pac only uses it for logging).
+    source_path = sidecar.get('source_path', '') if sidecar else ''
+    source_format = sidecar.get('source_format', '') if sidecar else ''
+
+    submeshes: list[SubMesh] = []
+
+    for mod_id in model_order:
+        geo_id = model_to_geo.get(mod_id)
+        if geo_id is None:
+            continue
+        geo = geo_nodes[geo_id]
+        sm_name = model_names.get(mod_id, f'submesh_{len(submeshes)}')
+
+        # Vertices
+        vn = _fbx_find(geo['children'], 'Vertices')
+        if not vn or not vn['props'] or not isinstance(vn['props'][0], list):
+            continue
+        vf = vn['props'][0]
+        base_verts: list[tuple[float, float, float]] = [
+            (vf[i], vf[i + 1], vf[i + 2]) for i in range(0, len(vf) - 2, 3)
+        ]
+
+        # Apply the Model's local TRS so that object-level transforms made in
+        # Blender (e.g. moving the mesh object rather than editing vertices) are
+        # correctly reflected in the imported vertex positions.
+        base_verts = _apply_model_transform(model_nodes.get(mod_id), base_verts)
+
+        # PolygonVertexIndex → list of polygons (each a list of vertex indices)
+        pn = _fbx_find(geo['children'], 'PolygonVertexIndex')
+        if not pn or not pn['props'] or not isinstance(pn['props'][0], list):
+            continue
+        pvi = pn['props'][0]
+        polygons: list[list[int]] = []
+        cur: list[int] = []
+        for idx in pvi:
+            if idx < 0:
+                cur.append(~idx)   # ~idx == -(idx+1), recovers the real vertex index
+                polygons.append(cur)
+                cur = []
+            else:
+                cur.append(idx)
+
+        # LayerElementNormal
+        normals_flat: list[float] | None = None
+        normal_index: list[int] | None = None
+        normal_by_poly_vert = True
+        normal_indexed = False
+        for le in _fbx_find_all(geo['children'], 'LayerElementNormal'):
+            mapping = _fbx_child_val(le, 'MappingInformationType', 'ByPolygonVertex')
+            ref     = _fbx_child_val(le, 'ReferenceInformationType', 'Direct')
+            nn  = _fbx_find(le['children'], 'Normals')
+            ni_n = _fbx_find(le['children'], 'NormalsIndex')
+            if nn and nn['props'] and isinstance(nn['props'][0], list):
+                normals_flat = nn['props'][0]
+                normal_by_poly_vert = (mapping != 'ByVertice')
+                normal_indexed = (ref == 'IndexToDirect')
+                if ni_n and ni_n['props'] and isinstance(ni_n['props'][0], list):
+                    normal_index = ni_n['props'][0]
+                break
+
+        # LayerElementUV
+        uv_flat: list[float] | None = None
+        uv_index: list[int] | None = None
+        uv_by_poly_vert = True
+        uv_indexed = True
+        for le in _fbx_find_all(geo['children'], 'LayerElementUV'):
+            mapping = _fbx_child_val(le, 'MappingInformationType', 'ByPolygonVertex')
+            ref = _fbx_child_val(le, 'ReferenceInformationType', 'IndexToDirect')
+            un = _fbx_find(le['children'], 'UV')
+            ui_n = _fbx_find(le['children'], 'UVIndex')
+            if un and un['props'] and isinstance(un['props'][0], list):
+                uv_flat = un['props'][0]
+                uv_by_poly_vert = (mapping != 'ByVertice')
+                uv_indexed = (ref == 'IndexToDirect')
+                if ui_n and ui_n['props'] and isinstance(ui_n['props'][0], list):
+                    uv_index = ui_n['props'][0]
+                break
+
+        # Per-corner UV and normal lookup (closed over per-geometry arrays)
+        def _get_uv(poly_vi: int, vi: int) -> tuple[float, float]:
+            if uv_flat is None:
+                return (0.0, 0.0)
+            if uv_by_poly_vert:
+                slot = uv_index[poly_vi] if (uv_indexed and uv_index is not None) else poly_vi
+            else:
+                slot = vi
+            u = uv_flat[slot * 2]
+            v = 1.0 - uv_flat[slot * 2 + 1]   # flip V (game convention)
+            return (u, v)
+
+        def _get_normal(poly_vi: int, vi: int) -> tuple[float, float, float]:
+            if normals_flat is None:
+                return (0.0, 1.0, 0.0)
+            if normal_by_poly_vert:
+                slot = normal_index[poly_vi] if (normal_indexed and normal_index is not None) else poly_vi
+            else:
+                slot = vi
+            base = slot * 3
+            return (normals_flat[base], normals_flat[base + 1], normals_flat[base + 2])
+
+        # Bone weights from FBX Cluster nodes.
+        skin_weights = _geo_skin_weights(geo_id)   # vi → [(bidx, w)]
+        has_skin = bool(skin_weights)
+        n_orig = len(base_verts)
+        sb_indices: list[tuple[int, ...]] = []
+        sb_weights: list[tuple[float, ...]] = []
+        for i in range(n_orig):
+            pairs = sorted(skin_weights.get(i, []), key=lambda x: -x[1])
+            sb_indices.append(tuple(b for b, _ in pairs))
+            sb_weights.append(tuple(w for _, w in pairs))
+
+        # Expand vertices: UV-seam splitting (same logic as import_obj)
+        local_verts: list[tuple[float, float, float]] = list(base_verts)
+        local_uvs: list[tuple[float, float]] = [(0.0, 0.0)] * len(base_verts)
+        local_norms: list[tuple[float, float, float]] = [(0.0, 1.0, 0.0)] * len(base_verts)
+        assigned: list[bool] = [False] * len(base_verts)
+        src_map: list[int] = list(range(len(base_verts)))
+        bone_indices_out: list[tuple[int, ...]] = list(sb_indices)
+        bone_weights_out: list[tuple[float, ...]] = list(sb_weights)
+        corner_cache: dict[tuple, int] = {}
+
+        def _resolve(vi: int, uv: tuple, norm: tuple) -> int:
+            key = (vi, uv, norm)
+            hit = corner_cache.get(key)
+            if hit is not None:
+                return hit
+            if 0 <= vi < len(assigned) and not assigned[vi]:
+                local_uvs[vi] = uv
+                local_norms[vi] = norm
+                assigned[vi] = True
+                corner_cache[key] = vi
+                return vi
+            if 0 <= vi < len(local_uvs) and local_uvs[vi] == uv and local_norms[vi] == norm:
+                corner_cache[key] = vi
+                return vi
+            clone = len(local_verts)
+            local_verts.append(base_verts[vi] if vi < len(base_verts) else (0.0, 0.0, 0.0))
+            local_uvs.append(uv)
+            local_norms.append(norm)
+            src_map.append(src_map[vi] if vi < len(src_map) else vi)
+            bone_indices_out.append(bone_indices_out[vi] if vi < len(bone_indices_out) else ())
+            bone_weights_out.append(bone_weights_out[vi] if vi < len(bone_weights_out) else ())
+            corner_cache[key] = clone
+            return clone
+
+        local_faces: list[tuple[int, int, int]] = []
+        poly_vi = 0
+        for poly in polygons:
+            corners = []
+            for vi in poly:
+                uv = _get_uv(poly_vi, vi)
+                norm = _get_normal(poly_vi, vi)
+                corners.append(_resolve(vi, uv, norm))
+                poly_vi += 1
+            for i in range(1, len(corners) - 1):
+                local_faces.append((corners[0], corners[i], corners[i + 1]))
+
+        sm = SubMesh(
+            name=sm_name,
+            material=sm_name,
+            vertices=local_verts,
+            uvs=local_uvs if len(local_uvs) == len(local_verts) else [],
+            normals=local_norms if len(local_norms) == len(local_verts) else [],
+            faces=local_faces,
+            bone_indices=bone_indices_out if has_skin else [],
+            bone_weights=bone_weights_out if has_skin else [],
+            vertex_count=len(local_verts),
+            face_count=len(local_faces),
+            source_vertex_map=src_map,
+        )
+        submeshes.append(sm)
+
+    result = ParsedMesh(
+        path=source_path,
+        format=source_format,
+        submeshes=submeshes,
+        total_vertices=sum(len(s.vertices) for s in submeshes),
+        total_faces=sum(len(s.faces) for s in submeshes),
+        has_uvs=any(s.uvs for s in submeshes),
+        has_bones=any(s.bone_indices for s in submeshes),
+    )
+
+    if submeshes:
+        all_v = [v for s in submeshes for v in s.vertices]
+        if all_v:
+            xs, ys, zs = zip(*all_v)
+            result.bbox_min = (min(xs), min(ys), min(zs))
+            result.bbox_max = (max(xs), max(ys), max(zs))
+
+    logger.info("Imported FBX %s: %d submeshes, %d verts, %d faces, source=%s (%s)",
+                fbx_path, len(submeshes), result.total_vertices,
                 result.total_faces, source_path, source_format)
     return result
 

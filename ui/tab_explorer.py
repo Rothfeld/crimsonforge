@@ -877,6 +877,8 @@ class ExplorerTab(QWidget):
                     menu.addSeparator()
                     import_act = menu.addAction("Import OBJ (preview rebuilt mesh)")
                     import_act.triggered.connect(lambda _=False, e=entry: self._import_mesh(e))
+                    import_fbx_act = menu.addAction("Import FBX (preview rebuilt mesh)")
+                    import_fbx_act.triggered.connect(lambda _=False, e=entry: self._import_mesh(e, fmt="fbx"))
                     # NEW in v1.22.9 — build the rebuilt PAC to a
                     # user folder without touching the live game
                     # archives. Fast iteration loop for mesh work.
@@ -889,10 +891,18 @@ class ExplorerTab(QWidget):
                     build_act.triggered.connect(
                         lambda _=False, e=entry: self._build_pac_to_folder(e)
                     )
+                    build_fbx_act = menu.addAction("Build PAC from FBX to Folder... (no patch)")
+                    build_fbx_act.triggered.connect(
+                        lambda _=False, e=entry: self._build_pac_to_folder(e, fmt="fbx")
+                    )
                     patch_act = menu.addAction("Import OBJ + Patch to Game")
                     patch_act.triggered.connect(lambda _=False, e=entry: self._import_and_patch_mesh(e))
+                    patch_fbx_act = menu.addAction("Import FBX + Patch to Game")
+                    patch_fbx_act.triggered.connect(lambda _=False, e=entry: self._import_and_patch_mesh(e, fmt="fbx"))
                     ship_act = menu.addAction("Import OBJ + Ship to App")
                     ship_act.triggered.connect(lambda _=False, e=entry: self._ship_single_mesh(e))
+                    ship_fbx_act = menu.addAction("Import FBX + Ship to App")
+                    ship_fbx_act.triggered.connect(lambda _=False, e=entry: self._ship_single_mesh(e, fmt="fbx"))
                     # NEW in v1.22.9 — one-click undo, no Steam
                     # Verify needed. Only enabled when a baseline
                     # snapshot exists for this PAC.
@@ -1922,17 +1932,26 @@ class ExplorerTab(QWidget):
             report.format_message(),
         )
 
-    def _import_mesh(self, entry: PamtFileEntry):
-        """Import an OBJ file, rebuild the mesh, and preview the result."""
-        obj_path = pick_file(self, "Select OBJ File", filters="OBJ Files (*.obj);;All Files (*.*)")
-        if not obj_path:
+    def _import_mesh(self, entry: PamtFileEntry, fmt: str = "obj"):
+        """Import an OBJ or FBX file, rebuild the mesh, and preview the result."""
+        if fmt == "fbx":
+            mesh_path = pick_file(self, "Select FBX File", filters="FBX Files (*.fbx);;All Files (*.*)")
+        else:
+            mesh_path = pick_file(self, "Select OBJ File", filters="OBJ Files (*.obj);;All Files (*.*)")
+        if not mesh_path:
             return
 
         try:
-            self._progress.set_status(f"Importing {os.path.basename(obj_path)}...")
+            self._progress.set_status(f"Importing {os.path.basename(mesh_path)}...")
 
-            from core.mesh_importer import import_obj, build_mesh, transfer_pam_edit_to_pamlod_mesh
-            imported = import_obj(obj_path)
+            if fmt == "fbx":
+                from core.mesh_importer import import_fbx, build_mesh, transfer_pam_edit_to_pamlod_mesh
+                imported = import_fbx(mesh_path)
+                obj_path = mesh_path
+            else:
+                from core.mesh_importer import import_obj, build_mesh, transfer_pam_edit_to_pamlod_mesh
+                imported = import_obj(mesh_path)
+                obj_path = mesh_path
 
             if not imported.submeshes:
                 show_error(self, "Import Error", "No geometry found in OBJ file.")
@@ -1977,13 +1996,14 @@ class ExplorerTab(QWidget):
                 "obj_path": obj_path,
             }
 
+            patch_label = f"Import {fmt.upper()} + Patch to Game"
             self._progress.set_status(
                 f"Imported: {imported.total_vertices:,} verts, "
                 f"{imported.total_faces:,} faces, {len(new_data):,} bytes. "
-                f"Right-click > 'Import OBJ + Patch to Game' to apply."
+                f"Right-click > '{patch_label}' to apply."
             )
             show_info(self, "Import Complete",
-                      f"Imported {os.path.basename(obj_path)}\n\n"
+                      f"Imported {os.path.basename(mesh_path)}\n\n"
                       f"Vertices: {imported.total_vertices:,}\n"
                       f"Faces: {imported.total_faces:,}\n"
                       f"Submeshes: {len(imported.submeshes)}\n"
@@ -1996,17 +2016,25 @@ class ExplorerTab(QWidget):
             logger.error("Mesh import error for %s: %s", entry.path, e)
             show_error(self, "Import Error", str(e))
 
-    def _import_and_patch_mesh(self, entry: PamtFileEntry):
-        """Import OBJ, rebuild binary, and patch directly into the game."""
-        obj_path = pick_file(self, "Select OBJ File", filters="OBJ Files (*.obj);;All Files (*.*)")
-        if not obj_path:
+    def _import_and_patch_mesh(self, entry: PamtFileEntry, fmt: str = "obj"):
+        """Import OBJ or FBX, rebuild binary, and patch directly into the game."""
+        if fmt == "fbx":
+            mesh_path = pick_file(self, "Select FBX File", filters="FBX Files (*.fbx);;All Files (*.*)")
+        else:
+            mesh_path = pick_file(self, "Select OBJ File", filters="OBJ Files (*.obj);;All Files (*.*)")
+        if not mesh_path:
             return
+        obj_path = mesh_path  # kept for downstream references
 
         try:
-            self._progress.set_status(f"Importing and patching {os.path.basename(obj_path)}...")
+            self._progress.set_status(f"Importing and patching {os.path.basename(mesh_path)}...")
 
-            from core.mesh_importer import import_obj, build_mesh, transfer_pam_edit_to_pamlod_mesh
-            imported = import_obj(obj_path)
+            if fmt == "fbx":
+                from core.mesh_importer import import_fbx, build_mesh, transfer_pam_edit_to_pamlod_mesh
+                imported = import_fbx(mesh_path)
+            else:
+                from core.mesh_importer import import_obj, build_mesh, transfer_pam_edit_to_pamlod_mesh
+                imported = import_obj(mesh_path)
 
             if not imported.submeshes:
                 show_error(self, "Import Error", "No geometry found in OBJ file.")
@@ -2151,8 +2179,8 @@ class ExplorerTab(QWidget):
             logger.error("Mesh patch error for %s: %s", entry.path, e)
             show_error(self, "Patch Error", str(e))
 
-    def _build_pac_to_folder(self, entry: PamtFileEntry):
-        """Convert an OBJ into a .pac / .pam / .pamlod file on disk
+    def _build_pac_to_folder(self, entry: PamtFileEntry, fmt: str = "obj"):
+        """Convert an OBJ or FBX into a .pac / .pam / .pamlod file on disk
         without touching the live game archives.
 
         Workflow
@@ -2181,12 +2209,13 @@ class ExplorerTab(QWidget):
         """
         from ui.dialogs.file_picker import pick_directory
 
-        obj_path = pick_file(
-            self, "Select OBJ File",
-            filters="OBJ Files (*.obj);;All Files (*.*)"
-        )
-        if not obj_path:
+        if fmt == "fbx":
+            mesh_path = pick_file(self, "Select FBX File", filters="FBX Files (*.fbx);;All Files (*.*)")
+        else:
+            mesh_path = pick_file(self, "Select OBJ File", filters="OBJ Files (*.obj);;All Files (*.*)")
+        if not mesh_path:
             return
+        obj_path = mesh_path  # kept for downstream references
 
         out_dir = pick_directory(self, "Select output folder for rebuilt PAC")
         if not out_dir:
@@ -2195,10 +2224,14 @@ class ExplorerTab(QWidget):
         try:
             self._progress.set_status(
                 f"Building {os.path.basename(entry.path)} from "
-                f"{os.path.basename(obj_path)}..."
+                f"{os.path.basename(mesh_path)}..."
             )
-            from core.mesh_importer import import_obj, build_mesh
-            imported = import_obj(obj_path)
+            if fmt == "fbx":
+                from core.mesh_importer import import_fbx, build_mesh
+                imported = import_fbx(mesh_path)
+            else:
+                from core.mesh_importer import import_obj, build_mesh
+                imported = import_obj(mesh_path)
             if not imported.submeshes:
                 show_error(self, "Import Error", "No geometry found in OBJ file.")
                 return
@@ -2513,13 +2546,16 @@ class ExplorerTab(QWidget):
         dlg = ShipMeshDialog(self._vfs, self._config, entries, prefilled, self._item_index, self)
         dlg.exec()
 
-    def _ship_single_mesh(self, entry: PamtFileEntry):
+    def _ship_single_mesh(self, entry: PamtFileEntry, fmt: str = "obj"):
         if not self._vfs:
             show_error(self, "Ship to App", "Load the game data first.")
             return
 
-        obj_path = pick_file(self, "Select OBJ File", filters="OBJ Files (*.obj);;All Files (*.*)")
-        if not obj_path:
+        if fmt == "fbx":
+            mesh_path = pick_file(self, "Select FBX File", filters="FBX Files (*.fbx);;All Files (*.*)")
+        else:
+            mesh_path = pick_file(self, "Select OBJ File", filters="OBJ Files (*.obj);;All Files (*.*)")
+        if not mesh_path:
             return
 
         from ui.dialogs.ship_mesh_dialog import ShipMeshDialog
@@ -2528,7 +2564,7 @@ class ExplorerTab(QWidget):
             self._vfs,
             self._config,
             [entry],
-            {entry.path.lower(): obj_path},
+            {entry.path.lower(): mesh_path},
             self._item_index,
             self,
         )
