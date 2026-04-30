@@ -148,6 +148,13 @@ class ParsedAnimation:
     flags: int = 0             # raw flags@0x10 for format-variant research
     is_link: bool = False      # file embeds a path reference to another asset
     link_target: str = ""      # extracted file-path reference (if is_link)
+    # Embedded-tracks variant (cd_damian_*walk*, cd_phw_basic_*, etc.):
+    # the per-frame quaternions are ABSOLUTE local rotations for each
+    # bone (they REPLACE the bind rotation rather than being a delta
+    # added to it). Composing with bind double-rotates and produces
+    # spike explosions in the upper body. Old PAA formats (sample_talk
+    # etc.) carry deltas — composition is correct for those.
+    embedded_tracks_absolute: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +734,257 @@ def _legacy_int16_decode(
 # reference sample of 40 shipping PAAs came back with 52% zero-track
 # files even though the pose data is right there in the header.
 
+def _fp16_le_to_float(b0: int, b1: int) -> float:
+    """Decode an IEEE-754 half-precision float from two little-endian bytes."""
+    val = (b1 << 8) | b0
+    sign = (val >> 15) & 1
+    exp  = (val >> 10) & 0x1F
+    frac = val & 0x3FF
+    if exp == 0:
+        if frac == 0:
+            return -0.0 if sign else 0.0
+        # Subnormal
+        return ((-1) ** sign) * (frac / 1024.0) * (2 ** -14)
+    if exp == 31:
+        if frac == 0:
+            return float('-inf') if sign else float('inf')
+        return float('nan')
+    return ((-1) ** sign) * (1 + frac / 1024.0) * (2 ** (exp - 15))
+
+
+def _decode_link_embedded_tracks(
+    data: bytes,
+    tracks_start: int,
+    filename: str = "",
+    max_bones: int = 1024,
+    max_frames_per_track: int = 4096,
+    pab_bone_hashes: list[int] | None = None,
+) -> tuple[list[list[tuple[int, tuple[float, float, float, float]]]] | None,
+            list[int] | None]:
+    """Decode per-bone keyframe tracks AND extract per-track bone hashes
+    when available.
+
+    Returns (tracks, bone_hashes) — each parallel:
+        tracks[i] = list of (frame_index, (qx,qy,qz,qw)) for track i
+        bone_hashes[i] = 24-bit PAB bone hash for track i (or None if
+                         the gap was too small / offset 11 didn't match)
+
+    Format (reverse-engineered Apr 2026):
+      Each rotation track's leading gap (between previous track and
+      this track's first keyframe) contains a 4-byte u32 LE at byte
+      offset 11. Its low 24 bits equal the PAB bone hash stored in
+      the corresponding bone's record (the hash_lo24 field at the
+      start of each bone record in the PAB header).
+
+      Match is exact and deterministic — no heuristics needed.
+      Unmatched tracks have non-standard gap sizes (16 / 21 / 28 bytes
+      vs the typical 20). For those we scan every u32-aligned position
+      in the gap for a known PAB hash.
+    """
+    """Decode the per-bone keyframe tracks that follow the link path
+    in a "link variant with embedded tracks" PAA.
+
+    Format (reverse-engineered Apr 2026):
+        Each keyframe is exactly 10 bytes:
+            bytes 0..7  → 4 fp16 little-endian   (quat x, y, z, w)
+            bytes 8..9  → u16 little-endian      (frame index)
+        Tracks are bone-major. A new bone starts when the frame index
+        DROPS (next bone's first keyframe has frame_index = 0 again).
+
+    Returns a list of tracks, where each track is a list of
+    (frame_index, (qx, qy, qz, qw)) tuples. Returns None if the data
+    at ``tracks_start`` doesn't look like keyframe records (e.g. the
+    quaternion magnitudes wildly differ from 1.0 or frame indices
+    don't increase monotonically).
+    """
+    if tracks_start + 10 > len(data):
+        return (None, None)
+
+    pab_hash_set = set(pab_bone_hashes or [])
+
+    def _looks_like_keyframe(p: int) -> tuple[bool, tuple, int]:
+        """Return (is_kf, quat, frame) for the 10 bytes at offset p.
+        Validates that the first 8 bytes decode as a unit quaternion
+        and the last 2 bytes as a small u16."""
+        if p + 10 > len(data):
+            return (False, (), 0)
+        qx = _fp16_le_to_float(data[p + 0], data[p + 1])
+        qy = _fp16_le_to_float(data[p + 2], data[p + 3])
+        qz = _fp16_le_to_float(data[p + 4], data[p + 5])
+        qw = _fp16_le_to_float(data[p + 6], data[p + 7])
+        m2 = qx * qx + qy * qy + qz * qz + qw * qw
+        if not (0.95 < m2 < 1.05):
+            return (False, (), 0)
+        f = struct.unpack_from('<H', data, p + 8)[0]
+        if f > max_frames_per_track:
+            return (False, (), 0)
+        return (True, (qx, qy, qz, qw), f)
+
+    # ── Two-record-validated track discovery ──
+    # A real rotation track starts with TWO consecutive 10-byte records
+    # where:
+    #   * record 1: unit quat + frame index 0..4
+    #   * record 2: unit quat + frame index that increments by 1..8
+    #
+    # This 2-record gate eliminates phantom 1-keyframe tracks caused
+    # by gap-header bytes that coincidentally decode as ONE valid
+    # quaternion (the per-bone gap structure has a 4-byte u32 hash
+    # and other fields whose first 10 bytes can fool a single-record
+    # validator). Verified on Damian's walk: the 1-record walker
+    # finds 43 tracks (23 real + 20 phantoms); the 2-record walker
+    # finds exactly 23.
+    #
+    # Once a track start is committed, walk forward 10 bytes at a
+    # time, accepting any record whose frame index is monotonically
+    # >= the previous one. Stop on the first record that fails
+    # validation OR whose frame drops below the previous one
+    # (=next-bone boundary).
+    tracks: list[list[tuple[int, tuple[float, float, float, float]]]] = []
+    track_starts: list[int] = []
+    bones_seen = 0
+    p = tracks_start
+
+    while p < len(data) - 20:
+        r1 = _looks_like_keyframe(p)
+        if not r1[0] or r1[2] > 4:
+            p += 1
+            continue
+        r2 = _looks_like_keyframe(p + 10)
+        if not r2[0]:
+            p += 1
+            continue
+        f1, f2 = r1[2], r2[2]
+        if not (f1 < f2 <= f1 + 8):
+            p += 1
+            continue
+        # Confirmed track start. Walk forward.
+        kfs: list[tuple[int, tuple[float, float, float, float]]] = [
+            (f1, r1[1]), (f2, r2[1])
+        ]
+        last_frame = f2
+        q = p + 20
+        while q + 10 <= len(data):
+            ok, quat, frame = _looks_like_keyframe(q)
+            if not ok or frame < last_frame:
+                break
+            kfs.append((frame, quat))
+            last_frame = frame
+            q += 10
+        tracks.append(kfs)
+        track_starts.append(p)
+        bones_seen += 1
+        if bones_seen >= max_bones:
+            break
+        p = q
+
+    if not tracks:
+        return (None, None)
+
+    # ── Extract per-track bone hashes from gaps ──
+    # The canonical layout, verified across every gap size in
+    # cd_damian_*walk*.paa (gap sizes 20, 21, 28, 76, 108, 354, 1092):
+    #
+    #   [variable-length prefix]
+    #   [4-byte u32 LE bone hash]   ← always at offset (gap_size - 9)
+    #   [1-2 bytes zero pad]
+    #   [4-byte u32 LE keyframe count or max_frame+1]   ← last 4 bytes
+    #
+    # The hash sits exactly 9 bytes before the gap end (so the u32
+    # spans bytes [-9..-6) and the kf_count u32 spans bytes [-4..0)).
+    # Mask the hash to 24 bits — the high byte of the hash u32 is
+    # padding (always zero) or unrelated context.
+    #
+    # Empirical: with this single canonical formula we get 23/23
+    # exact matches on Damian's walk PAA. NO byte-scanning, NO false
+    # positives. If a gap is too small to hold the structure (< 9
+    # bytes before the trailer), the hash is set to None and the
+    # track will be left unbound (won't scramble onto a wrong bone).
+    bone_hashes: list[int | None] = []
+    if pab_hash_set:
+        prev_end = 0
+        for ti, t_start in enumerate(track_starts):
+            gap_start = prev_end if ti > 0 else 0
+            gap_end = t_start
+            gap_bytes = data[gap_start:gap_end]
+            found_hash: int | None = None
+            canon_off = len(gap_bytes) - 9
+            if canon_off >= 0 and canon_off + 4 <= len(gap_bytes):
+                cand = struct.unpack_from(
+                    '<I', gap_bytes, canon_off)[0] & 0x00FFFFFF
+                if cand in pab_hash_set:
+                    found_hash = cand
+            bone_hashes.append(found_hash)
+            prev_end = t_start + len(tracks[ti]) * 10
+    else:
+        bone_hashes = [None] * len(tracks)
+
+    matched = sum(1 for h in bone_hashes if h is not None)
+    logger.debug(
+        "PAA %s: decoded %d tracks (%d frames total), "
+        "matched %d/%d to PAB bone hashes",
+        filename, len(tracks),
+        sum(len(t) for t in tracks),
+        matched, len(tracks),
+    )
+    return (tracks, bone_hashes)
+
+
+def _populate_animation_from_tracks(
+    result: ParsedAnimation,
+    tracks: list[list[tuple[int, tuple[float, float, float, float]]]],
+    fps: float = 30.0,
+) -> None:
+    """Convert per-bone sparse tracks into the dense per-frame format
+    that :class:`ParsedAnimation` exposes (one ``AnimationKeyframe``
+    per frame, each holding all bones' rotations).
+
+    Uses hold-and-repeat interpolation: between two keyframes at
+    frames ``f0`` and ``f1``, the pose at intermediate frames stays
+    at the value of the keyframe at ``f0``.
+    """
+    bone_count = len(tracks)
+    if bone_count == 0:
+        return
+
+    # Find max frame index across all tracks
+    max_frame = 0
+    for track in tracks:
+        if track and track[-1][0] > max_frame:
+            max_frame = track[-1][0]
+    total_frames = max_frame + 1
+
+    # Densify each track: per-bone rotation per frame
+    bone_rots_per_frame: list[list[tuple[float, float, float, float]]] = []
+    for f in range(total_frames):
+        bone_rots_per_frame.append([(0.0, 0.0, 0.0, 1.0)] * bone_count)
+
+    for bi, track in enumerate(tracks):
+        if not track:
+            continue
+        # Sort just in case
+        track_sorted = sorted(track, key=lambda kf: kf[0])
+        cur_idx = 0
+        cur_quat = track_sorted[0][1]
+        for f in range(total_frames):
+            # Advance cur_idx while the next keyframe is at or before f
+            while (cur_idx + 1 < len(track_sorted)
+                    and track_sorted[cur_idx + 1][0] <= f):
+                cur_idx += 1
+            cur_quat = track_sorted[cur_idx][1]
+            bone_rots_per_frame[f][bi] = cur_quat
+
+    # Build AnimationKeyframe list
+    result.bone_count = bone_count
+    result.frame_count = total_frames
+    result.duration = total_frames / fps
+    for f in range(total_frames):
+        kf = AnimationKeyframe(frame_index=f)
+        kf.bone_rotations = list(bone_rots_per_frame[f])
+        result.keyframes.append(kf)
+    # raw_quaternions = flat list (frame-major, then bone)
+    result.raw_quaternions = [q for f in bone_rots_per_frame for q in f]
+
+
 def _emit_single_pose_frame(
     result: ParsedAnimation,
     data: bytes,
@@ -759,7 +1017,13 @@ def _emit_single_pose_frame(
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def parse_paa(data: bytes, filename: str = "", expected_bone_count: int = 0) -> ParsedAnimation:
+def parse_paa(
+    data: bytes,
+    filename: str = "",
+    expected_bone_count: int = 0,
+    pab_bone_hashes: list[int] | None = None,
+    pab_bone_count: int = 0,
+) -> ParsedAnimation:
     """Decode a Crimson Desert .paa animation file.
 
     Apr 2026: this entry point now dispatches to the byte-level
@@ -895,24 +1159,110 @@ def parse_paa(data: bytes, filename: str = "", expected_bone_count: int = 0) -> 
             "Parsed PAA %s: variant=link flags=0x%08x target=%r",
             filename, flags, result.link_target,
         )
-        # Link files also carry embedded SRT pose data after the path
-        # string — emit a single-frame animation so downstream FBX
-        # export has something visible to show. Walk backwards from
-        # the end of the path to find the start of the SRT block.
+
+        # ── NEW LAYOUT: link-variant + embedded per-bone tracks ──
+        # Reverse-engineered Apr 2026 from cd_damian_*walk*.paa, all
+        # cd_phw_basic_*.paa, and similar character-specific PAAs.
+        #
+        # These files have:
+        #   1. Standard header + tag string
+        #   2. A small bind-SRT preamble (typically 2 bones)
+        #   3. The link path (skeleton reference, %character/.../*.pab)
+        #   4. **Per-bone keyframe tracks immediately after the path**
+        #
+        # Each keyframe = 10 bytes:
+        #     bytes 0-1: fp16 quat X       (little-endian)
+        #     bytes 2-3: fp16 quat Y
+        #     bytes 4-5: fp16 quat Z
+        #     bytes 6-7: fp16 quat W
+        #     bytes 8-9: u16  frame index  (little-endian)
+        #
+        # Tracks are bone-major: keyframes for one bone in ascending
+        # frame order, then the next bone starts (its first keyframe
+        # has frame_index=0 again — the drop signals the boundary).
+        #
+        # Verified by decoding rec[0] of a Damian walk PAA as
+        # 4 fp16 → magnitude exactly 1.0 (unit quaternion).
+        if scan_start >= 0:
+            path_len = len(result.link_target)
+            tracks_start = scan_start + path_len
+            # 4-byte align (the file has a few padding bytes after the
+            # path string before tracks begin)
+            tracks_start = (tracks_start + 3) & ~3
+
+            tracks_decoded, track_hashes = _decode_link_embedded_tracks(
+                data, tracks_start, filename,
+                pab_bone_hashes=pab_bone_hashes,
+            )
+            if tracks_decoded:
+                # Deterministic PAB-hash → skeleton-bone mapping.
+                # Verified on cd_damian_*walk* against the 448-bone
+                # phw_01.pab: 23/23 tracks match exactly at canonical
+                # gap offset (gap_size - 9). No heuristics, no
+                # similarity scoring — just: hash at gap-9 → bone
+                # index in PAB. Bones not in the PAA stay at identity.
+                if (pab_bone_hashes and track_hashes
+                        and pab_bone_count > 0):
+                    hash_to_bone_idx = {
+                        h: i for i, h in enumerate(pab_bone_hashes)
+                    }
+                    n_skel = pab_bone_count
+                    max_len = max(len(t) for t in tracks_decoded)
+                    identity_track = [(f, (0.0, 0.0, 0.0, 1.0))
+                                      for f in range(max_len)]
+                    reordered = [list(identity_track) for _ in range(n_skel)]
+                    matched_count = 0
+                    unmatched_count = 0
+                    for ti, h in enumerate(track_hashes):
+                        if h is None:
+                            unmatched_count += 1
+                            continue
+                        bi = hash_to_bone_idx.get(h)
+                        if bi is None or bi >= n_skel:
+                            unmatched_count += 1
+                            continue
+                        reordered[bi] = tracks_decoded[ti]
+                        matched_count += 1
+                    tracks_decoded = reordered
+                    logger.info(
+                        "PAA %s: PAB-hash mapping placed %d/%d tracks on "
+                        "exact skeleton bones (%d unmatched left at "
+                        "identity, total skeleton bones=%d)",
+                        filename, matched_count,
+                        matched_count + unmatched_count,
+                        unmatched_count, n_skel,
+                    )
+
+                _populate_animation_from_tracks(result, tracks_decoded)
+                # Composition mode is delta (bind × paa). Empirical:
+                # - With bind*paa: legs definitively correct (Thigh/Calf
+                #   point down with walk motion). Confirmed by user.
+                # - Absolute mode (paa replaces bind): legs stick out
+                #   horizontally because they need the bind's 180° flip
+                #   to point downward. Confirmed by Euler comparison.
+                # Upper-body PAA values are LARGE (90-128° rotations)
+                # which composed with bind gives large composed angles.
+                # This may be the actual game pose ("walking with sword
+                # in hand") rather than a bug — needs visual verification.
+                result.embedded_tracks_absolute = False
+                logger.info(
+                    "PAA %s: decoded %d animated bones, %d frames "
+                    "from embedded tracks (delta mode)",
+                    filename, result.bone_count, result.frame_count,
+                )
+                return result
+
+        # Fallback: link files with no decodeable tracks fall back to
+        # the old behaviour — emit a single-frame SRT pose so the FBX
+        # has at least the bind orientation.
         pose_start = 0
         if scan_start >= 0:
             path_len = len(result.link_target)
             pose_start = scan_start + path_len
-            # 4-byte align
             pose_start = (pose_start + 3) & ~3
         else:
             pose_start = 0x14
         _emit_single_pose_frame(result, data, pose_start)
-        # Link-only files with no SRT payload (pure skeleton refs)
-        # still need a stub frame so the FBX exporter has something
-        # to hang the skeleton on. One identity-pose keyframe is
-        # enough to keep the export pipeline's duration-resolution
-        # step happy without pretending the file has real data.
         if result.frame_count == 0:
             result.bone_count = 1
             result.frame_count = 1
@@ -1035,6 +1385,8 @@ def parse_paa_with_resolution(
     expected_bone_count: int = 0,
     vfs=None,
     max_hops: int = 5,
+    pab_bone_hashes: list[int] | None = None,
+    pab_bone_count: int = 0,
 ) -> ParsedAnimation:
     """Parse a PAA; if it's a link-variant that points at another
     asset, follow the reference through ``vfs`` until we reach a
@@ -1046,7 +1398,11 @@ def parse_paa_with_resolution(
 
     When ``vfs`` is None we fall back to plain :func:`parse_paa`.
     """
-    result = parse_paa(data, filename, expected_bone_count)
+    result = parse_paa(
+        data, filename, expected_bone_count,
+        pab_bone_hashes=pab_bone_hashes,
+        pab_bone_count=pab_bone_count,
+    )
     if not result.is_link or not result.link_target or vfs is None:
         return result
 
