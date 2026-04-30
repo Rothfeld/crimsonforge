@@ -872,6 +872,20 @@ class ExplorerTab(QWidget):
                     export_obj_act.triggered.connect(lambda _=False, e=entry: self._export_mesh(e, "obj"))
                     export_fbx_act = menu.addAction("Export as FBX")
                     export_fbx_act.triggered.connect(lambda _=False, e=entry: self._export_mesh(e, "fbx"))
+                    # The combined "Export Full Character FBX (Mesh + Bones +
+                    # Animation)" right-click action is intentionally NOT
+                    # exposed in this version. Underlying parsers / exporters
+                    # for skeleton + PAA animation + PABC bone palette are all
+                    # in place (core/skeleton_parser.py, core/animation_parser.py,
+                    # core/pabc_skin_palette.py, core/mesh_exporter.export_fbx_with_skeleton),
+                    # but the per-submesh slot-to-bone palette resolution is
+                    # not yet 100% accurate for the upper body of certain
+                    # character meshes (the runtime resolution lives inside the
+                    # game's compiled SkinMesh* C++ classes which we have not
+                    # finished decoding). The action is hidden until that
+                    # mapping is fully verified to avoid shipping FBXs with
+                    # subtle skin-shatter artefacts.  See core/pabc_skin_palette.py
+                    # docstring for the format we have decoded so far.
                     menu.addAction("Diagnose dye / tint system").triggered.connect(
                         lambda _=False, e=entry: self._diagnose_dye(e))
                     menu.addSeparator()
@@ -1723,6 +1737,605 @@ class ExplorerTab(QWidget):
             )
         except Exception as exc:
             show_error(self, "FBX export failed", str(exc))
+
+    def _export_full_character(self, entry: PamtFileEntry):
+        """Unified FBX export: mesh + skeleton + optional animation in ONE file.
+
+        Pipeline:
+          1. Parse the selected mesh PAC → ParsedMesh
+          2. Resolve the matching PAB skeleton (same auto-detect as
+             ``_export_mesh`` and ``_export_paa_fbx``)
+          3. Prompt the user to optionally pick a PAA animation file
+             from the game VFS (browse in a list of available PAAs
+             matching the rig prefix)
+          4. Pick output directory
+          5. Call ``export_fbx_with_skeleton(animation=...)`` so the
+             single FBX carries skinned mesh + armature + animation
+             curves
+          6. Show a result dialog with what was exported
+        """
+        from ui.dialogs.file_picker import pick_directory
+        from ui.dialogs.confirmation import show_error, show_info
+
+        # ── Step 1: parse the mesh ──
+        try:
+            mesh_data = self._vfs.read_entry_data(entry)
+            from core.mesh_parser import parse_mesh
+            mesh = parse_mesh(mesh_data, entry.path)
+        except Exception as exc:
+            show_error(self, "Mesh parse failed", str(exc))
+            return
+        if not mesh.submeshes:
+            show_error(self, "Export Error",
+                       "No geometry found in this file.")
+            return
+
+        # ── Step 2: resolve skeleton ──
+        from core.skeleton_resolver import (
+            VfsManagerAdapter, detect_rig_prefix, resolve_skeleton,
+        )
+        rig_prefix = detect_rig_prefix(entry.path)
+        manual_override = ""
+        if rig_prefix:
+            manual_override = self._config.get(
+                f"explorer.skeleton_override.{rig_prefix}", "",
+            )
+        adapter = VfsManagerAdapter(self._vfs)
+        try:
+            resolution = resolve_skeleton(
+                entry.path, adapter,
+                manual_override=manual_override or None,
+            )
+        except Exception as exc:
+            show_error(self, "Skeleton lookup failed", str(exc))
+            return
+        skeleton = resolution.skeleton
+        if skeleton is None or not skeleton.bones:
+            show_error(
+                self, "No Skeleton",
+                f"No matching .pab skeleton found for rig prefix "
+                f"'{rig_prefix}'.\n\n"
+                f"Reason: {resolution.reason or 'unknown'}\n\n"
+                f"Use the regular 'Export as FBX' action which will "
+                f"prompt you to browse for a .pab manually."
+            )
+            return
+
+        # NOTE: PABC palette remap was attempted but found insufficient.
+        # The body PABC has 437 records but vertex slots in the body
+        # submesh only reach 0-47 — those records reference torso/leg
+        # bones, NOT the upper-body deformation bones. A per-submesh
+        # offset/sub-palette must exist somewhere in the PAC format
+        # that we haven't decoded yet. Until then, the parser's
+        # direct-index fallback is left in place (its output partially
+        # works for legs because slots 17,18,27,31 happen to coincide
+        # with PAB[17,18,27,31] = R/L Thigh, R/L Calf).
+
+        # ── Step 3: auto-discover PAA animations matching this rig ──
+        # Walk the loaded VFS, collect every .paa file whose path looks
+        # related to this character / rig. Show them in a picker dialog
+        # — user clicks the one to bake in (or "None" to skip animation).
+        candidate_paas = self._discover_paa_candidates(entry.path, rig_prefix)
+        logger.info("Export Full Character: discovered %d PAA candidates "
+                    "for rig %r", len(candidate_paas), rig_prefix)
+
+        animation = None
+        anim_label = ""
+        picked_paa_path: str | None = None
+        from PySide6.QtWidgets import QMessageBox
+
+        if not candidate_paas:
+            cont = QMessageBox.question(
+                self,
+                "No Animations Found",
+                f"No .paa animation files were found that match this "
+                f"character / rig (prefix: '{rig_prefix or 'unknown'}').\n\n"
+                f"Continue with mesh + skeleton only (no animation)?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if cont != QMessageBox.Yes:
+                return
+        else:
+            picked_paa_path = self._prompt_pick_paa(
+                candidate_paas, rig_prefix or "")
+            logger.info("Export Full Character: picker returned %r",
+                        picked_paa_path)
+            if picked_paa_path is None:
+                # User cancelled — abort the whole export.
+                logger.info("Export Full Character: user cancelled, aborting")
+                return
+            if picked_paa_path == "":
+                # User explicitly chose "None — no animation"
+                logger.info("Export Full Character: user picked No Animation")
+                # Make ABSOLUTELY sure the user knows — easy to click
+                # "No Animation" by mistake when "Use Selected PAA" is
+                # right next to it.
+                cont = QMessageBox.question(
+                    self,
+                    "Confirm: No Animation",
+                    "You're about to export the character WITHOUT any "
+                    "animation curves.\n\n"
+                    "The FBX will contain only the mesh + skeleton in "
+                    "T-pose. Pressing Spacebar in Blender will do nothing.\n\n"
+                    "Are you sure?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if cont != QMessageBox.Yes:
+                    return
+            else:
+                try:
+                    logger.info("Export Full Character: reading PAA %s",
+                                picked_paa_path)
+                    # Look up the PamtFileEntry, then read via VFS.
+                    paa_entry = self._lookup_vfs_entry(picked_paa_path)
+                    if paa_entry is None:
+                        raise FileNotFoundError(
+                            f"PAA path {picked_paa_path!r} not found in VFS"
+                        )
+                    paa_data = self._vfs.read_entry_data(paa_entry)
+                    # Use parse_paa_with_resolution so link-variant PAAs
+                    # (≈ 19% of corpus, e.g. cd_damian_*walk*.paa is a
+                    # link to a base file) get auto-followed to the real
+                    # animation data. Plain parse_paa returns 1 frame /
+                    # 1 bone shells for those.
+                    #
+                    # Pull the PAB's per-bone hash list and pass it in.
+                    # The parser uses these hashes to deterministically
+                    # map each PAA track to its exact skeleton bone via
+                    # the 24-bit hash field in the inter-track gap.
+                    # No heuristics — exact 1+1=2 mapping.
+                    pab_hashes = self._extract_pab_bone_hashes(
+                        resolution.pab_path)
+                    from core.animation_parser import parse_paa_with_resolution
+                    animation = parse_paa_with_resolution(
+                        paa_data, picked_paa_path,
+                        vfs=self._vfs, max_hops=5,
+                        pab_bone_hashes=pab_hashes,
+                        pab_bone_count=len(skeleton.bones),
+                    )
+                    logger.info(
+                        "Export Full Character: parsed PAA — "
+                        "%d frames, %.3fs, %d animated bones",
+                        animation.frame_count, animation.duration,
+                        animation.bone_count,
+                    )
+                    # No heuristic mapping needed — parse_paa_with_resolution
+                    # already placed each track at its exact skeleton
+                    # bone index via PAB-hash matching. Tracks for
+                    # bones we couldn't match get identity rotation
+                    # (no movement) so unmatched bones stay at bind.
+                    # Loud warning if it's STILL a link/empty after
+                    # resolution — we silently exported empty before.
+                    if animation.frame_count <= 1 or animation.bone_count <= 1:
+                        from PySide6.QtWidgets import QMessageBox as _QMB
+                        cont = _QMB.question(
+                            self,
+                            "Animation Looks Empty",
+                            f"The selected PAA resolved to only "
+                            f"{animation.frame_count} frame(s) with "
+                            f"{animation.bone_count} bone(s).\n\n"
+                            f"That usually means it's a stub / unresolved "
+                            f"link reference. The exported FBX will play "
+                            f"a static T-pose, not an animation.\n\n"
+                            f"Continue anyway?",
+                            _QMB.Yes | _QMB.No, _QMB.No,
+                        )
+                        if cont != _QMB.Yes:
+                            return
+                    anim_label = (
+                        f" + {os.path.basename(picked_paa_path)} "
+                        f"({animation.frame_count} frames, "
+                        f"{animation.duration:.2f}s)"
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "Export Full Character: failed to read/parse %s",
+                        picked_paa_path,
+                    )
+                    cont = QMessageBox.question(
+                        self,
+                        "Animation Read Failed",
+                        f"Could not read or parse:\n  {picked_paa_path}\n\n"
+                        f"Error: {exc}\n\n"
+                        f"Continue without animation?",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.No,
+                    )
+                    if cont != QMessageBox.Yes:
+                        return
+                    animation = None
+
+        # ── Step 4: pick output dir ──
+        output_dir = pick_directory(self, "Choose FBX output directory")
+        if not output_dir:
+            return
+
+        # ── Step 5: export ──
+        clean_path = entry.path.replace("\\", "/")
+        basename = os.path.splitext(clean_path)[0].replace("/", "_")
+        if animation is not None:
+            basename += "_anim"
+
+        try:
+            self._progress.set_status(
+                f"Exporting full character FBX to {output_dir}..."
+            )
+            from core.mesh_exporter import export_fbx_with_skeleton
+            fbx_path = export_fbx_with_skeleton(
+                mesh, skeleton, output_dir,
+                name=basename,
+                scale=1.0,
+                # Filter OFF by default — the heuristic was deleting real
+                # mesh (foot soles, rigid extremities). 1:1 vertex export
+                # keeps every vertex; the round-trip is lossless without
+                # the filter.
+                filter_unskinned_outliers=False,
+                animation=animation,
+                fps=30.0,
+            )
+        except Exception as exc:
+            show_error(self, "FBX export failed", str(exc))
+            return
+
+        # ── Step 6: show summary ──
+        rig_label = os.path.basename(resolution.pab_path) if resolution.pab_path else "?"
+        show_info(
+            self,
+            "Full Character Exported",
+            f"Wrote {fbx_path}\n\n"
+            f"Mesh: {mesh.total_vertices:,} verts, "
+            f"{mesh.total_faces:,} faces, "
+            f"{len(mesh.submeshes)} submeshes\n"
+            f"Skeleton: {len(skeleton.bones)} bones (rig {rig_label}, "
+            f"source {resolution.source})\n"
+            f"Animation:{anim_label or ' none'}\n\n"
+            f"Sidecar: {os.path.basename(fbx_path)}.cfmeta.json (preserves "
+            f"spike-filter for round-trip)\n"
+            f"Debug log: {os.path.basename(fbx_path)}.debug.txt"
+        )
+
+    def _extract_pab_bone_hashes(self, pab_path: str) -> list[int]:
+        """Read raw PAB bytes and pull the 24-bit per-bone hash that
+        Pearl Abyss stores at the start of each bone record.
+
+        Returns one hash per bone, in PAB-order. Empty list if the
+        PAB cannot be loaded.
+
+        These hashes are the EXACT identifier the PAA file uses to
+        reference bones in its inter-track gaps. Matching by hash
+        gives a deterministic 1+1=2 track-to-bone mapping with
+        zero ambiguity.
+        """
+        import struct as _struct
+        pab_entry = self._lookup_vfs_entry(pab_path) if pab_path else None
+        if pab_entry is None:
+            return []
+        try:
+            pab_data = self._vfs.read_entry_data(pab_entry)
+        except Exception:
+            return []
+        if len(pab_data) < 0x18 or pab_data[:4] != b"PAR ":
+            return []
+        try:
+            bone_count = _struct.unpack_from('<H', pab_data, 0x14)[0]
+        except _struct.error:
+            return []
+        hashes: list[int] = []
+        off = 0x17
+        for i in range(bone_count):
+            if off + 4 > len(pab_data):
+                break
+            hash_lo24 = _struct.unpack_from('<I', pab_data, off)[0] & 0x00FFFFFF
+            name_len = pab_data[off + 3]
+            hashes.append(hash_lo24)
+            # Per-bone record stride = 4 (hash+name_len) + name + 4 (parent)
+            #                        + 256 (4 matrices) + 40 (SRT) + 1 (align)
+            off += 4 + name_len + 4 + 256 + 40 + 1
+        return hashes
+
+    def _map_paa_to_deformation_bones(self, animation, skeleton):
+        """Map PAA tracks (bone-major, identity-padded) onto the
+        skeleton's DEFORMATION bones in hierarchy order.
+
+        Why: PAA files (especially the link-with-embedded-tracks
+        layout used by Damian/phw walks) carry one track per bone
+        in a specific order — but the skeleton has bones we know
+        the animation never targets:
+          - ``B_TL_*``       IK helper / control bones (climb target,
+                             foot/hand IK, position trackers)
+          - ``B_face_*``     facial rig
+          - ``B_Eyeball_*``  eye direction
+          - ``B_Eyeside_*``  eye corner sliders
+          - ``B_Forehead_*`` brow
+          - ``B_Chin_*``     chin / jaw shape
+          - ``B_Lip_*``      lip / mouth
+          - ``B_Cheek_*``    cheek shape
+          - ``B_Tongue_*``   tongue
+          - ``B_Ear_*``      ear shape
+          - ``Bip_Weapon_*`` weapon attach points
+          - bones whose bind matrix is at world origin (helpers)
+
+        Filtering these out leaves the BODY DEFORMATION bones
+        (Bip01, Pelvis, Spine, Thighs, Calves, Feet, Neck, Head,
+        Shoulders, Arms, Forearms, Hands, Fingers) which are the
+        bones a walk / run / idle PAA actually animates.
+
+        Tracks then map track[i] → kept_bone[i] in skeleton order.
+        """
+        from core.animation_parser import AnimationKeyframe
+        import copy
+
+        # Identify deformation bones (skip helper families).
+        helper_prefixes = (
+            "B_TL_", "B_face", "B_Eyeball", "B_Eyeside", "B_Forehead",
+            "B_Chin", "B_Lip", "B_Cheek", "B_Tongue", "B_Ear",
+            "B_MoveControl", "B_CatchMe", "B_EnemyCatch",
+            "Bip_Weapon",
+        )
+        keep_indices: list[int] = []
+        for b in skeleton.bones:
+            name = b.name or ""
+            if any(name.startswith(p) for p in helper_prefixes):
+                continue
+            # Skip bones at world origin (likely helpers we missed)
+            bm = getattr(b, "bind_matrix", None)
+            if bm and len(bm) == 16:
+                tx, ty, tz = bm[12], bm[13], bm[14]
+                if abs(tx) < 1e-4 and abs(ty) < 1e-4 and abs(tz) < 1e-4:
+                    continue
+            keep_indices.append(b.index)
+
+        n_tracks = animation.bone_count
+        n_kept = len(keep_indices)
+        logger.info(
+            "Export Full Character: %d PAA tracks → %d deformation bones "
+            "(skipped %d helper/face/eye bones from %d total)",
+            n_tracks, n_kept,
+            len(skeleton.bones) - n_kept, len(skeleton.bones),
+        )
+        if n_kept == 0:
+            return animation
+
+        # Build new keyframes: each frame has bone_count entries; only
+        # the kept bones get the PAA track values, others stay identity.
+        new_frames = []
+        bone_count = len(skeleton.bones)
+        for kf in animation.keyframes:
+            new_rotations = [(0.0, 0.0, 0.0, 1.0)] * bone_count
+            for ti in range(min(n_tracks, n_kept)):
+                bi = keep_indices[ti]
+                if ti < len(kf.bone_rotations):
+                    new_rotations[bi] = kf.bone_rotations[ti]
+            new_frames.append(AnimationKeyframe(
+                frame_index=kf.frame_index,
+                bone_rotations=new_rotations,
+            ))
+
+        anim = copy.copy(animation)
+        anim.keyframes = new_frames
+        anim.bone_count = bone_count
+        return anim
+
+    def _lookup_vfs_entry(self, path: str):
+        """Find a ``PamtFileEntry`` by its in-game path.
+
+        VfsManager doesn't expose a path→entry lookup directly, so we
+        walk the loaded PAMTs (same data the picker already iterates).
+        Returns the first entry whose ``.path`` matches the requested
+        string (case-insensitive, normalised slashes), or None if no
+        match is found.
+        """
+        target = path.replace("\\", "/").lower()
+        for _group, pamt in getattr(self._vfs, "_pamt_cache", {}).items():
+            for entry in getattr(pamt, "file_entries", []):
+                if (entry.path or "").replace("\\", "/").lower() == target:
+                    return entry
+        return None
+
+    def _discover_paa_candidates(self, mesh_path: str,
+                                  rig_prefix: str | None) -> list[str]:
+        """Scan the loaded VFS for .paa files relevant to this rig.
+
+        Strategy (in order of preference):
+          1. PAAs that contain the FULL character name in the path
+             (e.g. 'damian' for cd_phw_00_nude_00_0001_damian.pac).
+          2. PAAs whose path contains the rig prefix (e.g. 'cd_phw_00_').
+          3. PAAs in any 'animation' folder matching the broad 'cd_ph[wm]'
+             family (fallback for shared animations).
+
+        Returns paths sorted by relevance (best match first), capped at
+        500 entries to keep the picker dialog responsive.
+        """
+        # Extract the character name from the mesh path. PAC convention:
+        # cd_<rig>_<NN>_<part>_<NNNN>_<NN>_<charname>.pac → charname is
+        # the trailing identifier after the last underscore.
+        mesh_basename = os.path.splitext(os.path.basename(mesh_path))[0]
+        parts = mesh_basename.split("_")
+        char_name = parts[-1] if len(parts) >= 4 else ""
+        char_name_lc = char_name.lower() if char_name else ""
+
+        rig_prefix_lc = (rig_prefix or "").lower()
+        # Trim the rig prefix back to its broad family (cd_phw_00_ →
+        # cd_phw_) so we still match shared animations that drop the LOD
+        # number from their path.
+        rig_family_lc = rig_prefix_lc
+        if rig_family_lc:
+            family_parts = rig_family_lc.rstrip("_").split("_")
+            if len(family_parts) >= 2:
+                rig_family_lc = "_".join(family_parts[:2])
+
+        seen: set[str] = set()
+        char_hits: list[str] = []
+        rig_hits: list[str] = []
+        family_hits: list[str] = []
+
+        # Walk every loaded PAMT — _pamt_cache holds them all after the
+        # game-load step that runs at app startup.
+        for _group, pamt in getattr(self._vfs, "_pamt_cache", {}).items():
+            for entry in getattr(pamt, "file_entries", []):
+                p = entry.path
+                if not p or p in seen:
+                    continue
+                p_lc = p.lower()
+                if not p_lc.endswith(".paa"):
+                    continue
+                seen.add(p)
+
+                if char_name_lc and char_name_lc in p_lc:
+                    char_hits.append(p)
+                elif rig_prefix_lc and rig_prefix_lc in p_lc:
+                    rig_hits.append(p)
+                elif (rig_family_lc and rig_family_lc in p_lc
+                      and "/animation" in p_lc.replace("\\", "/")):
+                    family_hits.append(p)
+
+        # Sort each bucket alphabetically for a stable list.
+        char_hits.sort()
+        rig_hits.sort()
+        family_hits.sort()
+
+        # Combine in priority order, dedupe (a file can match multiple
+        # buckets — keep first match).
+        combined: list[str] = []
+        for bucket in (char_hits, rig_hits, family_hits):
+            for p in bucket:
+                if p not in combined:
+                    combined.append(p)
+
+        return combined[:500]
+
+    def _prompt_pick_paa(self, candidates: list[str],
+                         rig_prefix: str) -> str | None:
+        """Open a list-picker dialog showing matching PAA files.
+
+        Returns:
+          - The selected PAA path (string)
+          - "" (empty string) if the user clicks the "None — skip" button
+          - None if the user clicks Cancel / closes the dialog
+        """
+        from PySide6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QListWidget,
+            QPushButton, QLabel, QListWidgetItem,
+        )
+        from PySide6.QtCore import Qt
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Pick Animation (PAA)")
+        dlg.resize(720, 480)
+
+        layout = QVBoxLayout(dlg)
+
+        info = QLabel(
+            f"Found <b>{len(candidates)}</b> .paa files matching this "
+            f"character / rig"
+            + (f" (prefix <code>{rig_prefix}</code>)" if rig_prefix else "")
+            + ".<br>Pick one to bake into the FBX, or click "
+            "<b>No Animation</b> to skip."
+        )
+        info.setTextFormat(Qt.RichText)
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # Search filter
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Filter:"))
+        search_box = QLineEdit()
+        search_box.setPlaceholderText(
+            "Type to filter — e.g. 'idle', 'walk', 'talk'..."
+        )
+        search_row.addWidget(search_box, stretch=1)
+        layout.addLayout(search_row)
+
+        # File list
+        list_widget = QListWidget()
+        list_widget.setAlternatingRowColors(True)
+        for p in candidates:
+            item = QListWidgetItem(p)
+            item.setData(Qt.UserRole, p)
+            list_widget.addItem(item)
+        layout.addWidget(list_widget, stretch=1)
+
+        # Filter logic
+        def _apply_filter(text: str):
+            t = text.strip().lower()
+            for i in range(list_widget.count()):
+                it = list_widget.item(i)
+                hidden = bool(t) and (t not in it.text().lower())
+                it.setHidden(hidden)
+        search_box.textChanged.connect(_apply_filter)
+
+        # Buttons — "Use Selected PAA" is the default (Enter triggers it).
+        # "No Animation" is intentionally smaller / less prominent so it
+        # can't be hit by accident, and clicking it pops a confirmation
+        # in the caller.
+        btn_row = QHBoxLayout()
+        btn_pick = QPushButton("✓ Use Selected PAA")
+        btn_pick.setDefault(True)
+        btn_pick.setAutoDefault(True)
+        btn_pick.setStyleSheet(
+            "QPushButton { padding: 8px 16px; font-weight: bold; }"
+        )
+        btn_none = QPushButton("No Animation")
+        btn_none.setStyleSheet(
+            "QPushButton { padding: 6px 10px; color: #888; }"
+        )
+        btn_cancel = QPushButton("Cancel")
+        btn_row.addWidget(btn_pick)
+        btn_row.addStretch(1)
+        btn_row.addWidget(btn_none)
+        btn_row.addWidget(btn_cancel)
+        layout.addLayout(btn_row)
+
+        result = {"path": None}
+
+        def _on_pick():
+            sel = list_widget.currentItem()
+            if sel is None:
+                # No selection — show feedback so user knows to pick.
+                from PySide6.QtWidgets import QMessageBox as _QMB
+                _QMB.information(
+                    dlg, "Pick a PAA First",
+                    "Click on a PAA file in the list above first, then "
+                    "click Use Selected PAA. Or double-click any entry."
+                )
+                return
+            result["path"] = sel.data(Qt.UserRole)
+            dlg.accept()
+
+        def _on_none():
+            result["path"] = ""
+            dlg.accept()
+
+        def _on_cancel():
+            result["path"] = None
+            dlg.reject()
+
+        btn_pick.clicked.connect(_on_pick)
+        btn_none.clicked.connect(_on_none)
+        btn_cancel.clicked.connect(_on_cancel)
+        list_widget.itemDoubleClicked.connect(lambda *_: _on_pick())
+
+        # Pre-select the first item so Enter / double-click works
+        # immediately. Also disable Use Selected if no items at all
+        # (shouldn't happen since caller checks candidates non-empty).
+        if list_widget.count() > 0:
+            list_widget.setCurrentRow(0)
+        else:
+            btn_pick.setEnabled(False)
+
+        # Disable Use Selected when no item is highlighted (after filter
+        # narrows the list to zero, etc.).
+        def _on_selection_changed():
+            btn_pick.setEnabled(list_widget.currentItem() is not None
+                                and not list_widget.currentItem().isHidden())
+        list_widget.currentItemChanged.connect(
+            lambda *_: _on_selection_changed())
+
+        if dlg.exec() == QDialog.Accepted:
+            return result["path"]
+        return None
 
     # ─── Shared helpers for FBX-with-skeleton flows ─────────────────
 
