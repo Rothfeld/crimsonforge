@@ -1103,16 +1103,46 @@ def parse_pac(data: bytes, filename: str = "") -> ParsedMesh:
             packed_bones = ()
             packed_weights = ()
             if rec_off + 36 <= min(len(data), lod0_split):
-                raw_slots = struct.unpack_from("<BBBB", data, rec_off + 28)
-                raw_weights = struct.unpack_from("<BBBB", data, rec_off + 32)
-                mapped_bones = []
+                # PAC vertex skin layout (verified Apr 2026):
+                #   bytes 28-31: 4 weights (u8), sum to 240-255
+                #   bytes 32-35: 4 slot indices (u8) — see palette note below
+                #
+                # The slot value is NOT a direct PAB bone index. It's
+                # an index into a per-mesh bone palette stored in the
+                # adjacent ``.pabc`` file (verified Apr 2026 via
+                # decryption + reverse-engineering). The 4-entry
+                # inline palette in the PAC submesh def is just a
+                # fast-path subset; slots ≥ 4 require the PABC for
+                # correct resolution.
+                #
+                # We don't have the PABC palette here — parse_pac
+                # only sees the .pac bytes. The caller is expected
+                # to remap bone_indices via :func:`apply_skin_palette`
+                # after loading the PABC. Until that's done, the
+                # slot values in this list are PABC RECORD INDICES,
+                # not PAB bone indices, and using them directly
+                # produces the upper-body-shatter artifact (slot 17
+                # would map to PAB[17] = R Thigh when the correct
+                # answer is PABC[17] = R ThighTwist).
+                raw_weights = struct.unpack_from("<BBBB", data, rec_off + 28)
+                raw_slots   = struct.unpack_from("<BBBB", data, rec_off + 32)
+                mapped_slots = []
                 mapped_weights = []
+                weight_sum = sum(raw_weights)
+                inv_sum = (1.0 / weight_sum) if weight_sum > 0 else 0.0
                 for slot, weight in zip(raw_slots, raw_weights):
                     if slot == 0xFF or weight == 0:
                         continue
-                    mapped_bones.append(bone_palette[slot] if slot < len(bone_palette) else slot)
-                    mapped_weights.append(weight / 255.0)
-                packed_bones = tuple(mapped_bones)
+                    # Store the raw slot. If the inline palette covers
+                    # this slot (the 4-entry fast-path) apply it now
+                    # so callers without a PABC still get something
+                    # sensible for slots 0-3.
+                    if slot < len(bone_palette):
+                        mapped_slots.append(int(bone_palette[slot]))
+                    else:
+                        mapped_slots.append(int(slot))
+                    mapped_weights.append(weight * inv_sum)
+                packed_bones = tuple(mapped_slots)
                 packed_weights = tuple(mapped_weights)
             bone_indices.append(packed_bones)
             bone_weights.append(packed_weights)
@@ -1357,15 +1387,22 @@ def _decode_pac_vertex_record(
     packed_bones: tuple[int, ...] = ()
     packed_weights: tuple[float, ...] = ()
     if rec_off + 36 <= len(data):
-        raw_slots = struct.unpack_from("<BBBB", data, rec_off + 28)
-        raw_weights = struct.unpack_from("<BBBB", data, rec_off + 32)
+        # CRITICAL FIX: bytes 28-31 = WEIGHTS, bytes 32-35 = INDICES.
+        # Verified by sum-check: bytes 28-31 sum to ~240-255 (u8
+        # weight pattern), bytes 32-35 contain small palette indices.
+        # The previous code had these reversed, causing upper body
+        # vertices to bind to leg-region bones (= explosion).
+        raw_weights = struct.unpack_from("<BBBB", data, rec_off + 28)
+        raw_slots   = struct.unpack_from("<BBBB", data, rec_off + 32)
         mapped_bones = []
         mapped_weights = []
+        weight_sum = sum(raw_weights)
+        inv_sum = (1.0 / weight_sum) if weight_sum > 0 else 0.0
         for slot, weight in zip(raw_slots, raw_weights):
             if slot == 0xFF or weight == 0:
                 continue
             mapped_bones.append(desc.palette[slot] if slot < len(desc.palette) else slot)
-            mapped_weights.append(weight / 255.0)
+            mapped_weights.append(weight * inv_sum)
         packed_bones = tuple(mapped_bones)
         packed_weights = tuple(mapped_weights)
 
@@ -1842,3 +1879,53 @@ def is_mesh_file(path: str) -> bool:
     """Check if a file path is a supported mesh format."""
     ext = os.path.splitext(path.lower())[1]
     return ext in (".pam", ".pamlod", ".pac")
+
+
+def apply_skin_palette(mesh: ParsedMesh, slot_to_pab: list[int]) -> int:
+    """Remap each vertex's bone indices through the per-mesh PABC palette.
+
+    PAC vertex bone slots are NOT direct PAB bone indices — they're
+    indices into a per-mesh palette stored in the adjacent ``.pabc``
+    file. ``parse_pac`` returns the raw slots; this function applies
+    the palette so bone_indices reference the correct skeleton bones.
+
+    ``slot_to_pab`` is a list where ``slot_to_pab[N]`` gives the global
+    PAB bone index for slot N. Slots outside the palette are dropped.
+
+    Returns the number of (vertex, bone) pairs that were successfully
+    remapped. A return value of 0 indicates the palette didn't match
+    any slots — typically a sign the wrong PABC was loaded.
+    """
+    n_remapped = 0
+    n_dropped = 0
+    palette_len = len(slot_to_pab)
+    for sm in mesh.submeshes:
+        new_indices: list[tuple[int, ...]] = []
+        new_weights: list[tuple[float, ...]] = []
+        for slots, weights in zip(sm.bone_indices, sm.bone_weights):
+            kept_b: list[int] = []
+            kept_w: list[float] = []
+            for slot, w in zip(slots, weights):
+                if 0 <= slot < palette_len:
+                    pab_idx = slot_to_pab[slot]
+                    if pab_idx >= 0:
+                        kept_b.append(int(pab_idx))
+                        kept_w.append(float(w))
+                        n_remapped += 1
+                        continue
+                n_dropped += 1
+            # Renormalize the kept weights so they still sum to 1.
+            wsum = sum(kept_w)
+            if wsum > 1e-6:
+                inv = 1.0 / wsum
+                kept_w = [w * inv for w in kept_w]
+            new_indices.append(tuple(kept_b))
+            new_weights.append(tuple(kept_w))
+        sm.bone_indices = new_indices
+        sm.bone_weights = new_weights
+
+    logger.info(
+        "Applied skin palette: %d vertex-bone pairs remapped, %d dropped",
+        n_remapped, n_dropped,
+    )
+    return n_remapped
