@@ -30,7 +30,14 @@ from PySide6.QtWidgets import QApplication
 from version import APP_VERSION, APP_NAME
 from utils.config import ConfigManager, ConfigLoadError
 from utils.logger import setup_logger, get_logger
-from ai.provider_registry import ProviderRegistry
+# NOTE: ai.provider_registry is intentionally NOT imported at module
+# top-level. Importing it eagerly pulls in 10 provider modules
+# (openai, anthropic, gemini, deepseek, ollama, vllm, mistral,
+# cohere, custom, deepl) which collectively take ~2 s warm and
+# ~14 s cold on first launch. We hand MainWindow a factory that
+# imports + builds the registry only when an AI-using tab actually
+# calls a registry method (typically when the user opens Translate
+# or Settings, not at startup).
 from ui.main_window import MainWindow
 
 
@@ -130,10 +137,24 @@ def main():
     logger.info("%s v%s starting...", APP_NAME, APP_VERSION)
     logger.info("Config loaded from: %s", config.config_path)
 
-    registry = ProviderRegistry()
-    registry.initialize_from_config(config.get_section("ai_providers"))
-    logger.info("AI providers initialized: %s", registry.list_enabled_provider_ids())
-    window = MainWindow(config, registry)
+    def _build_registry():
+        """Construct the AI provider registry on first access.
+
+        Runs at most once — the result is cached inside MainWindow.
+        Imported lazily so users who never open the AI-aware tabs
+        don't pay the ~2-14 s startup cost of loading 10 provider
+        SDK modules (openai, anthropic, gemini, deepseek, etc.).
+        """
+        from ai.provider_registry import ProviderRegistry
+        registry = ProviderRegistry()
+        registry.initialize_from_config(config.get_section("ai_providers"))
+        logger.info(
+            "AI providers initialized: %s",
+            registry.list_enabled_provider_ids(),
+        )
+        return registry
+
+    window = MainWindow(config, registry_factory=_build_registry)
 
     _close_splash()
     window.show()

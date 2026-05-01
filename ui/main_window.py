@@ -28,7 +28,13 @@ from utils.config import ConfigManager
 from utils.platform_utils import auto_discover_game
 from core.vfs_manager import VfsManager
 from core.game_reload_service import GameReloadService, ReloadPayload
-from ai.provider_registry import ProviderRegistry
+# NOTE: ai.provider_registry is intentionally NOT imported at module
+# top-level. Importing it eagerly pulls in 10 provider modules
+# (openai, anthropic, gemini, deepseek, ollama, vllm, mistral,
+# cohere, custom, deepl) which collectively cost ~2 s warm and
+# ~14 s cold on first launch. Most users never touch the AI tabs
+# (Translate / Settings), so we defer that cost until first access
+# via the ``registry_factory`` constructor arg + lazy property.
 from ui.themes.dark import DARK_THEME
 from ui.themes.light import LIGHT_THEME
 from ui.dialogs.confirmation import show_error
@@ -63,6 +69,48 @@ class _LazyPlaceholder(QWidget):
     pass
 
 
+class _LazyRegistryProxy:
+    """Proxy that defers building the AI provider registry until first
+    actual method call.
+
+    Settings tab is materialised at startup so its theme-changed
+    signal can be wired before the user does anything. If we passed
+    a real ProviderRegistry, that pulls in 10 provider modules
+    (~14 s cold start). Instead we pass this proxy: tab construction
+    just stores the proxy as ``self._registry`` and only when a
+    handler later does e.g. ``self._registry.get_provider(pid)`` do
+    we build the real registry on demand.
+    """
+
+    __slots__ = ("_factory", "_real")
+
+    def __init__(self, factory):
+        # ``factory`` is a zero-arg callable that returns a fully
+        # initialised ProviderRegistry. It runs at most once;
+        # subsequent attribute access reuses the cached instance.
+        object.__setattr__(self, "_factory", factory)
+        object.__setattr__(self, "_real", None)
+
+    def _resolve(self):
+        if self._real is None:
+            object.__setattr__(self, "_real", self._factory())
+        return self._real
+
+    def __getattr__(self, name):
+        # __getattr__ only fires for attributes we don't define
+        # ourselves, so the proxy's internal _factory / _real are
+        # safe — they go through __getattribute__.
+        return getattr(self._resolve(), name)
+
+    def __setattr__(self, name, value):
+        setattr(self._resolve(), name, value)
+
+    def __repr__(self):
+        if self._real is None:
+            return "<_LazyRegistryProxy unresolved>"
+        return f"<_LazyRegistryProxy resolved={self._real!r}>"
+
+
 class MainWindow(QMainWindow):
     """Main application window.
 
@@ -70,10 +118,36 @@ class MainWindow(QMainWindow):
     After game path is set and loaded, all tabs unlock.
     """
 
-    def __init__(self, config: ConfigManager, registry: ProviderRegistry):
+    def __init__(
+        self,
+        config: ConfigManager,
+        registry=None,
+        *,
+        registry_factory=None,
+    ):
+        """Construct the main window.
+
+        ``registry`` (optional, eager) and ``registry_factory``
+        (optional, lazy) are mutually exclusive: pass one or the
+        other. The lazy form defers the ``ai.provider_registry``
+        import + provider initialisation until the first AI-using
+        tab actually CALLS a registry method, shaving roughly 2 s
+        warm / 14 s cold off cold-start time for users who never
+        open an AI-aware tab. Settings + Translate tabs receive the
+        proxy in their constructor and resolve the real registry
+        on first attribute access.
+        """
         super().__init__()
         self._config = config
-        self._registry = registry
+        # ``_registry_cache`` is the cached registry instance.
+        # ``_registry_factory`` is the deferred constructor that
+        # builds it on first access via the ``_registry`` property.
+        if registry is not None:
+            self._registry_cache = registry
+            self._registry_factory = None
+        else:
+            self._registry_cache = None
+            self._registry_factory = registry_factory
         self._game_loaded = False
         self._vfs: VfsManager = None
         self._packages_path = ""
@@ -208,6 +282,31 @@ class MainWindow(QMainWindow):
             self._lock_tabs()
             self._show_main_tabs()
             QTimer.singleShot(300, self._auto_discover_and_load)
+
+    @property
+    def _registry(self):
+        """Lazy accessor for the AI provider registry.
+
+        Returns the eager registry instance if one was supplied,
+        otherwise a :class:`_LazyRegistryProxy` that defers the
+        ``ai.provider_registry`` import until any registry method
+        is actually called. This keeps cold-start fast for users
+        who never open Translate / Settings.
+        """
+        if self._registry_cache is not None:
+            return self._registry_cache
+        if self._registry_factory is None:
+            raise RuntimeError(
+                "MainWindow has no AI provider registry — "
+                "construct it with either ``registry=...`` or "
+                "``registry_factory=...``."
+            )
+        # Wrap the factory in a proxy so even *constructing* a tab
+        # that takes the registry doesn't pay the import cost — the
+        # registry only materialises on first method call from a
+        # tab handler.
+        self._registry_cache = _LazyRegistryProxy(self._registry_factory)
+        return self._registry_cache
 
     # ------------------------------------------------------------------
     # Lazy tab materialisation — three phases to keep the UI responsive.
