@@ -11,3 +11,22 @@ deepl>=1.17.0
 numpy>=1.26.0
 Pillow>=10.3.0
 chardet>=5.2.0
+
+# Optional but recommended — soft fallbacks exist in the code if
+# missing, so the app still runs without these. Listed here so the
+# default `pip install -r requirements.txt` flow gives users the
+# best experience.
+#
+# psutil:    accurate "available memory" check before mesh repacks.
+#            Falls back to Windows GlobalMemoryStatusEx if missing.
+# edge_tts:  free Microsoft Edge cloud TTS in the Audio tab.
+#            The TTS provider list shows / hides it based on
+#            whether this import succeeds.
+psutil>=5.9.0
+edge-tts>=6.1.0
+
+# Optional, NOT installed by default — local Whisper STT downloads
+# multi-GB model weights on first use. Uncomment if you want
+# offline speech-to-text in the Audio tab. Cloud STT (OpenAI
+# whisper-1, gpt-4o-transcribe) works without it.
+# openai-whisper>=20231117
