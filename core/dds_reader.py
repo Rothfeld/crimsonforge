@@ -109,6 +109,35 @@ def expected_mip_payload_size(info: DdsInfo, width: int, height: int) -> int | N
         return width * height
     if info.format == "Luminance 16-bit":
         return width * height * 2
+    # DX10 uncompressed formats identified by DXGI format string
+    _dxgi_bpp = {
+        "BC1 (DXT1)": None, "BC1 sRGB": None,  # block-compressed, handled above
+        "R10G10B10A2_UNORM": 32, "R10G10B10A2_UINT": 32,
+        "R16G16B16A16_FLOAT": 64,
+        "R32G32B32A32_FLOAT": 128,
+        "R16_FLOAT": 16,
+        "R32_FLOAT": 32,
+        "R8_UNORM": 8, "R8_UINT": 8,
+    }
+    # DXGI format names from read_dds_info look like "BC1 (DXT1)" or "DX10 (DXGI=28)"
+    if info.format.startswith("DX10 (DXGI="):
+        try:
+            dxgi = int(info.format.split("=")[1].rstrip(")"))
+        except (ValueError, IndexError):
+            return None
+        _dxgi_id_bpp = {
+            28: 32, 29: 32, 30: 32, 31: 32,         # RGBA8
+            87: 32, 88: 32, 89: 32, 90: 32, 91: 32, # BGRA8
+            24: 32, 25: 32,  # R10G10B10A2 — texture/climate_texture_2.dds
+            10: 64,          # R16G16B16A16F — texture/referencearealightprefiltered.dds
+             2: 128,         # R32G32B32A32F
+            54: 16, 55: 16,  # R16F
+            41: 32, 43: 32,  # R32F
+            61: 8,  62: 8,   # R8 — leveldata/global_extraregionmap.dds, global_regionmap.dds
+        }
+        bpp = _dxgi_id_bpp.get(dxgi)
+        if bpp is not None:
+            return width * height * bpp // 8
     return None
 
 

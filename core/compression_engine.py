@@ -178,9 +178,9 @@ def _decompress_type1_dds_per_mip_sizes(data: bytes, original_size: int) -> byte
             # fall through to the existing strategies or raise.
             return data
 
-    body = data[128:]
+    body = data[info.data_offset:]
     pos = 0
-    out = bytearray(data[:128])
+    out = bytearray(data[:info.data_offset])
 
     for lvl in range(info.mip_count):
         on_disk = reserved[lvl] if lvl < max_explicit else 0
