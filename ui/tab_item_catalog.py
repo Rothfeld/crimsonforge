@@ -5,10 +5,11 @@ from __future__ import annotations
 from collections import Counter
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QTimer
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QComboBox,
     QHBoxLayout,
     QHeaderView,
@@ -27,7 +28,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.item_catalog import ItemCatalogData, ItemCatalogRecord, GameDataTableRecord, build_item_catalog, write_catalog_exports
+from core.item_catalog import (
+    ItemCatalogData,
+    ItemCatalogRecord,
+    GameDataTableRecord,
+    build_item_catalog,
+    build_item_catalog_cached,
+    write_catalog_exports,
+)
 from core.vfs_manager import VfsManager
 from utils.thread_worker import FunctionWorker
 
@@ -283,6 +291,12 @@ class _GameDataTableModel(QAbstractTableModel):
 
 
 class ItemCatalogTab(QWidget):
+    # See DialogueCatalogTab for the rationale — these signals route
+    # the result of an inline (worker-thread) build back to the UI
+    # thread so widget mutations stay on the main thread.
+    _lazy_init_finished = Signal(object)  # ItemCatalogData
+    _lazy_init_error = Signal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._packages_path = ""
@@ -294,6 +308,8 @@ class ItemCatalogTab(QWidget):
         self._search_timer.timeout.connect(self._apply_filters)
         self._item_model = _ItemCatalogModel(self)
         self._table_model = _GameDataTableModel(self)
+        self._lazy_init_finished.connect(self._on_worker_finished)
+        self._lazy_init_error.connect(self._on_worker_error)
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -475,7 +491,46 @@ class ItemCatalogTab(QWidget):
         if self._packages_path == packages_path and self._data is not None:
             return
         self._packages_path = packages_path
-        self._refresh_from_game()
+
+        # See DialogueCatalogTab for the full rationale: when called
+        # from MainWindow's lazy-tab worker thread, build inline so
+        # the loading overlay stays up until the data is actually
+        # ready. From the UI thread (Refresh button), use the inner
+        # worker so we don't freeze the UI.
+        ui_thread = QApplication.instance().thread() if QApplication.instance() else None
+        if ui_thread is not None and QThread.currentThread() is not ui_thread:
+            self._build_catalog_inline(packages_path)
+        else:
+            self._refresh_from_game()
+
+    def _build_catalog_inline(self, packages_path: str) -> None:
+        """Run the build SYNCHRONOUSLY on the calling worker thread.
+
+        After the build, marshal the result back to the UI thread
+        via a queued signal so widget population happens on the
+        right thread.
+        """
+        try:
+            vfs = VfsManager(packages_path)
+            data = build_item_catalog_cached(vfs)
+            out_dir = Path(__file__).resolve().parents[1] / "exports" / "item_catalog"
+            try:
+                write_catalog_exports(data, out_dir)
+            except Exception:
+                # Export-writing is a nice-to-have side effect — log
+                # but don't kill the tab init if disk is full or
+                # the exports dir is read-only.
+                import logging
+                logging.getLogger(__name__).exception(
+                    "item catalog export write failed"
+                )
+            self._lazy_init_finished.emit(data)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).exception(
+                "item catalog inline build failed"
+            )
+            self._lazy_init_error.emit(f"{type(e).__name__}: {e}")
 
     def _refresh_from_game(self) -> None:
         if not self._packages_path or self._worker is not None:
@@ -496,7 +551,10 @@ class ItemCatalogTab(QWidget):
             worker.report_progress(0, message)
 
         vfs = VfsManager(packages_path)
-        data = build_item_catalog(vfs, progress_fn=progress)
+        # Manual Refresh hits the same disk cache as the lazy-init
+        # path — first run pays the build cost, subsequent runs are
+        # ~100 ms.
+        data = build_item_catalog_cached(vfs, progress_fn=progress)
         out_dir = Path(__file__).resolve().parents[1] / "exports" / "item_catalog"
         write_catalog_exports(data, out_dir)
         return data

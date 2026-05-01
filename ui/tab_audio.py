@@ -116,7 +116,7 @@ from core.vfs_manager import VfsManager
 from core.pamt_parser import PamtFileEntry
 from core.audio_converter import wem_to_wav, get_audio_info, audio_to_wav
 from core.audio_index import (
-    AudioEntry, build_audio_index, build_paloc_lookup,
+    AudioEntry, build_audio_index, build_audio_index_cached, build_paloc_lookup,
     get_all_categories, get_all_languages, VOICE_LANG_PACKAGES,
 )
 from ui.widgets.audio_player import AudioPlayerWidget
@@ -729,16 +729,19 @@ class AudioTab(QWidget):
         self._progress.set_progress(0, "Building audio index...")
         QApplication.processEvents()
 
-        # Build paloc lookup for text linking
-        paloc_lookup = build_paloc_lookup(vfs, groups,
-            progress_callback=lambda p, m: (self._progress.set_status(m), QApplication.processEvents()))
-
-        self._progress.set_status("Indexing voice audio files...")
-        QApplication.processEvents()
-
-        # Build audio index with paloc linking
-        audio_entries = build_audio_index(vfs, groups, paloc_lookup,
-            progress_callback=lambda p, m: (self._progress.set_progress(p, m), QApplication.processEvents()))
+        # Build (or load from cache) the linked audio index in one
+        # shot. Cached builds skip both the paloc lookup AND the
+        # audio walk — second open of this tab is ~100 ms instead
+        # of ~30-90 s on a full game install. The fingerprint covers
+        # every relevant PAMT, so a Steam patch invalidates the
+        # cache automatically.
+        audio_entries = build_audio_index_cached(
+            vfs, groups,
+            progress_callback=lambda p, m: (
+                self._progress.set_progress(p, m),
+                QApplication.processEvents(),
+            ),
+        )
 
         self._model.set_data(audio_entries)
 

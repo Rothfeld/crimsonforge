@@ -5,10 +5,11 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QTimer
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QComboBox,
     QHBoxLayout,
     QHeaderView,
@@ -33,6 +34,7 @@ from core.dialogue_catalog import (
     DialogueRecord,
     DialogueSpeakerRecord,
     build_dialogue_catalog,
+    build_dialogue_catalog_cached,
     write_dialogue_exports,
 )
 from core.vfs_manager import VfsManager
@@ -245,6 +247,15 @@ class _DialogueLineModel(QAbstractTableModel):
 
 
 class DialogueCatalogTab(QWidget):
+    # Cross-thread signals for the lazy-init blocking path. When the
+    # main window's lazy-init worker calls initialize_from_game from
+    # a worker thread, we run the build inline on that thread and
+    # emit one of these signals to marshal the result back to the
+    # UI thread. Default Qt.QueuedConnection ensures the slots run
+    # on whichever thread the receiver lives on (the UI thread).
+    _lazy_init_finished = Signal(object)  # DialogueCatalogData
+    _lazy_init_error = Signal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._packages_path = ""
@@ -259,6 +270,8 @@ class DialogueCatalogTab(QWidget):
         self._search_timer.setInterval(180)
         self._search_timer.timeout.connect(self._apply_filters)
         self._line_model = _DialogueLineModel(self)
+        self._lazy_init_finished.connect(self._on_worker_finished)
+        self._lazy_init_error.connect(self._on_worker_error)
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -434,7 +447,52 @@ class DialogueCatalogTab(QWidget):
         if self._packages_path == packages_path and self._data is not None:
             return
         self._packages_path = packages_path
-        self._refresh_from_game()
+
+        # Two callers reach here:
+        #   1. The "Refresh From Game" button on the UI thread.
+        #      We must NOT block it — kick off an inner worker and
+        #      let the UI keep painting.
+        #   2. The MainWindow lazy-tab dispatcher running on its
+        #      own worker thread. If we kick off an *inner* worker
+        #      and return immediately, the dispatcher reports the
+        #      tab "ready" while the build is still running for
+        #      another 30-90 s — the user sees the loading overlay
+        #      vanish into a half-empty tab. We instead run the
+        #      build inline on that worker thread and only return
+        #      once the data is ready.
+        ui_thread = QApplication.instance().thread() if QApplication.instance() else None
+        if ui_thread is not None and QThread.currentThread() is not ui_thread:
+            self._build_catalog_inline(packages_path)
+        else:
+            self._refresh_from_game()
+
+    def _build_catalog_inline(self, packages_path: str) -> None:
+        """Run the catalog build SYNCHRONOUSLY on the calling worker
+        thread (e.g. the lazy-tab dispatcher). After the build, marshal
+        the result back to the UI thread via a queued signal so widget
+        mutation happens on the right thread.
+        """
+        try:
+            vfs = VfsManager(packages_path)
+            data = build_dialogue_catalog_cached(vfs)
+            out_dir = Path(__file__).resolve().parents[1] / "exports" / "dialogue_catalog"
+            try:
+                write_dialogue_exports(data, out_dir)
+            except Exception:
+                # Export-writing isn't required for the in-app view —
+                # log but don't fail the whole tab init if disk
+                # is full or the exports directory is read-only.
+                import logging
+                logging.getLogger(__name__).exception(
+                    "dialogue catalog export write failed"
+                )
+            self._lazy_init_finished.emit(data)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).exception(
+                "dialogue catalog inline build failed"
+            )
+            self._lazy_init_error.emit(f"{type(e).__name__}: {e}")
 
     def _refresh_from_game(self) -> None:
         if not self._packages_path or self._worker is not None:
@@ -455,7 +513,10 @@ class DialogueCatalogTab(QWidget):
             worker.report_progress(0, message)
 
         vfs = VfsManager(packages_path)
-        data = build_dialogue_catalog(vfs, progress_fn=progress)
+        # Manual Refresh uses the cached builder too — first run
+        # on a freshly patched game pays the build cost and
+        # repopulates the cache; identical reruns are ~100 ms.
+        data = build_dialogue_catalog_cached(vfs, progress_fn=progress)
         out_dir = Path(__file__).resolve().parents[1] / "exports" / "dialogue_catalog"
         write_dialogue_exports(data, out_dir)
         return data
