@@ -267,6 +267,17 @@ class ItemCatalogRecord:
     pac_files: list[str] = field(default_factory=list)
     prefab_hashes: list[int] = field(default_factory=list)
     search_text: str = ""
+    # Inventory icon DDS paths discovered from the live PAMTs at build
+    # time. Multiple paths exist for items that ship with regional /
+    # rarity / variant icon overrides (``_r``, ``_ii``, ``_iii``, etc.).
+    # The Catalog Browser dialog picks the canonical entry via the same
+    # ``primary_icon`` heuristic the Simple Mode prototype uses.
+    icon_paths: list[str] = field(default_factory=list)
+    # Localized item name as parsed from ``localizationstring_eng.paloc``
+    # (or whatever paloc is keyed off the ``loc_key`` field). Stored on
+    # the record so a UI can render ``Canta Plate Armor`` next to the
+    # icon without having to re-load the localisation table.
+    display_name: str = ""
 
 
 @dataclass(slots=True)
@@ -667,8 +678,11 @@ def parse_iteminfo_records(vfs: VfsManager, equip_types: list[str]) -> list[Item
 
         prefab_hashes: list[int] = []
         search_end = min(len(data), pos + 800)
+        # The May 3 2026 game patch changed the iteminfo prefab-block
+        # marker from 0x0E to 0x0F. Old delimiter kept as a fallback for
+        # users on a pre-patch game install.
         for scan in range(pos + 14, search_end - 15):
-            if data[scan] != 0x0E:
+            if data[scan] != 0x0F and data[scan] != 0x0E:
                 continue
             count1 = struct.unpack_from("<I", data, scan + 3)[0]
             count2 = struct.unpack_from("<I", data, scan + 7)[0]
@@ -783,6 +797,116 @@ def build_game_data_tables(vfs: VfsManager) -> list[GameDataTableRecord]:
     return tables
 
 
+_ICON_PREFIX_RE = re.compile(
+    r"(?:^|/)itemicon_(?:prefab_)?(?P<base>[a-z0-9_]+)\.dds$",
+    re.IGNORECASE,
+)
+
+
+def _build_icon_index(vfs: VfsManager) -> dict[str, list[str]]:
+    """Walk every package group's PAMT once and return
+    ``{base_lower: [paths]}`` for each ``itemicon_*.dds`` entry.
+
+    The lookup base is the icon's stem after stripping the
+    ``itemicon_`` (or ``itemicon_prefab_``) prefix and the ``.dds``
+    extension — e.g. ``ui/itemicon_prefab_cd_m0001_00_so_phm_ub_22170.dds``
+    indexes under ``cd_m0001_00_so_phm_ub_22170``. That is exactly the
+    stem the catalog records carry in ``pac_files``, so per-record
+    lookup is a single ``dict.get`` away.
+
+    PAMTs that fail to load (corrupt or password-protected) are
+    silently skipped — never raise during catalog build, since icon
+    paths are an enrichment, not a blocker for browsing.
+    """
+    index: dict[str, list[str]] = {}
+    pkg_dir = Path(vfs.packages_path)
+    # Group folders are 4-digit numerics directly under packages/
+    # (``0000``, ``0008``, ``0020`` etc.). Discovering them via
+    # ``Path.iterdir`` keeps the build agnostic to which groups
+    # actually exist on a given install or future Steam patch.
+    group_dirs: list[str] = []
+    if pkg_dir.is_dir():
+        for child in pkg_dir.iterdir():
+            if child.is_dir() and child.name.isdigit() and len(child.name) == 4:
+                group_dirs.append(child.name)
+    group_dirs.sort()
+
+    for group in group_dirs:
+        try:
+            pamt = vfs.load_pamt(group)
+        except Exception:
+            continue
+        for entry in pamt.file_entries:
+            m = _ICON_PREFIX_RE.search(entry.path.replace("\\", "/").lower())
+            if not m:
+                continue
+            base = m.group("base")
+            index.setdefault(base, []).append(entry.path)
+    return index
+
+
+def _populate_icon_paths(items: list[ItemCatalogRecord],
+                         icon_index: dict[str, list[str]]) -> None:
+    """In-place enrich every record with its inventory-icon paths.
+
+    Two passes so leveling-variant records (``*_0.am``, ``*_1.am`` ...)
+    that share a base item's mesh inherit that base item's icon —
+    without this the catalog browser shows the placeholder for
+    ~12,400 records (every level / rarity variant) when the underlying
+    weapon really does ship with an icon.
+
+    Pass 1 — direct pac-stem lookup against ``itemicon_prefab_<base>.dds``.
+        Each pac_file basename is stripped of the ``.pac`` extension and
+        looked up. Multiple matches accumulate so consumers that want
+        to show a primary icon plus regional / rarity variants have the
+        full set available.
+
+    Pass 2 — variant inheritance. Records with no pac_files but a
+        ``variant_base_name`` that points at a record with icons borrow
+        that record's icon list. Bumps coverage from ~17% (mesh-bearing
+        items only) to ~80% (mesh-bearing + every leveled variant).
+    """
+    icons_by_internal: dict[str, list[str]] = {}
+    for item in items:
+        seen: set[str] = set()
+        for pac in item.pac_files:
+            name = pac.lower().rsplit("/", 1)[-1]
+            if name.endswith(".pac"):
+                name = name[:-4]
+            for path in icon_index.get(name, ()):
+                if path not in seen:
+                    seen.add(path)
+                    item.icon_paths.append(path)
+        if item.icon_paths:
+            icons_by_internal[item.internal_name] = item.icon_paths
+
+    for item in items:
+        if item.icon_paths:
+            continue
+        base = item.variant_base_name
+        if not base or base == item.internal_name:
+            continue
+        base_icons = icons_by_internal.get(base)
+        if base_icons:
+            item.icon_paths = list(base_icons)
+
+
+def _populate_display_names(vfs: VfsManager,
+                            items: list[ItemCatalogRecord]) -> None:
+    """In-place enrich every record with its English display name.
+
+    Resolves ``loc_key`` against the same English localization table
+    that ``core.item_index.parse_localization`` uses. Records without
+    a loc_key — or whose loc_key has no matching entry — keep their
+    empty ``display_name`` and remain searchable by internal name.
+    """
+    from core.item_index import parse_localization
+    loc_dict = parse_localization(vfs)
+    for item in items:
+        if item.loc_key and item.loc_key in loc_dict:
+            item.display_name = loc_dict[item.loc_key]
+
+
 def build_item_catalog(vfs: VfsManager, progress_fn: PROGRESS_FN | None = None) -> ItemCatalogData:
     """Pure (uncached) build. Always reparses + rebuilds.
 
@@ -803,6 +927,14 @@ def build_item_catalog(vfs: VfsManager, progress_fn: PROGRESS_FN | None = None) 
     tables = build_game_data_tables(vfs)
 
     items = base_items + variant_items
+
+    _progress(progress_fn, "Resolving English display names from localization...")
+    _populate_display_names(vfs, items)
+
+    _progress(progress_fn, "Discovering inventory icons across PAMTs...")
+    icon_index = _build_icon_index(vfs)
+    _populate_icon_paths(items, icon_index)
+
     items.sort(
         key=lambda item: (
             item.top_category.lower(),
@@ -817,6 +949,15 @@ def build_item_catalog(vfs: VfsManager, progress_fn: PROGRESS_FN | None = None) 
     return ItemCatalogData(items=items, tables=tables)
 
 
+# Bump this when the iteminfo / hash-table parsing logic changes in a way
+# that produces different ItemCatalogData output for the same input bytes.
+# Mixed into the cache fingerprint so old caches built with a previous parser
+# version are silently rejected and rebuilt — users never see stale data
+# (e.g. empty display_name fields after the May 3 2026 0x0E -> 0x0F delimiter
+# fix) bleeding into a fresh launch.
+_PARSER_VERSION = "2026-05-04-iteminfo-0x0F+display-aliases+icon-paths+variant-inherit"
+
+
 def build_item_catalog_cached(
     vfs: VfsManager,
     progress_fn: PROGRESS_FN | None = None,
@@ -827,14 +968,18 @@ def build_item_catalog_cached(
     calls deserialize the pickled result in ~100 ms. The fingerprint
     covers PAMTs the build reads (0008 game-data + 0009 hash table) —
     a Steam patch bumps mtime there, invalidates the cache, and the
-    next open transparently rebuilds.
+    next open transparently rebuilds. The parser version is mixed in
+    so a code-only change to the parser also invalidates the cache.
     """
     from utils import build_cache
 
     pkg = Path(vfs.packages_path)
-    fingerprint = build_cache.fingerprint_paths([
-        pkg / "0008" / "0.pamt",
-        pkg / "0009" / "0.pamt",
+    fingerprint = build_cache.fingerprint_strings([
+        build_cache.fingerprint_paths([
+            pkg / "0008" / "0.pamt",
+            pkg / "0009" / "0.pamt",
+        ]),
+        _PARSER_VERSION,
     ])
 
     cached = build_cache.load_cached("item_catalog", fingerprint)

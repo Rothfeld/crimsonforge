@@ -249,6 +249,25 @@ def decode_dds_to_rgba(data: bytes) -> tuple[int, int, bytes]:
     Returns (width, height, rgba_bytes) or raises on unsupported format.
     Only supports DXT1, DXT5, and uncompressed RGBA for preview.
     """
+    # If the file's body is shorter than the header declares, it may be a
+    # type-1 self-compressed DDS where the LZ4 sizes are embedded in the
+    # reserved area. Try the in-package decompressor before validating.
+    info_pre = read_dds_info(data)
+    expected_total = expected_dds_data_size(info_pre)
+    if expected_total is not None and len(data) < expected_total:
+        try:
+            from core.compression_engine import (
+                _decompress_type1_dds_per_mip_sizes,
+                _decompress_type1_dds_first_mip_lz4_tail,
+            )
+            expanded = _decompress_type1_dds_per_mip_sizes(data, expected_total)
+            if len(expanded) < expected_total:
+                expanded = _decompress_type1_dds_first_mip_lz4_tail(data, expected_total)
+            if len(expanded) >= expected_total:
+                data = expanded
+        except Exception:
+            pass
+
     info = validate_dds_payload_size(data)
     w, h = info.width, info.height
     offset = info.data_offset
@@ -300,6 +319,32 @@ def decode_dds_to_rgba(data: bytes) -> tuple[int, int, bytes]:
     if info.format == "Luminance 16-bit":
         return w, h, _decode_luminance_16(data[offset:], w, h)
 
+    # DX10 uncompressed formats (DXGI ID encoded in info.format string).
+    # Dispatched here because read_dds_info marks all DX10 files compressed=True,
+    # so the standard "not info.compressed" RGBA branch above does not fire.
+    if info.format.startswith("DX10 (DXGI="):
+        dxgi = _dx10_dxgi_id(info)
+        if dxgi in (28, 29, 30, 31):  # R8G8B8A8 (incl. sRGB / SNORM)
+            return w, h, _decode_dx10_rgba8(data[offset:], w, h, swap_rb=False)
+        if dxgi in (87, 88, 90, 91):  # B8G8R8A8 (incl. sRGB / TYPELESS)
+            return w, h, _decode_dx10_rgba8(data[offset:], w, h, swap_rb=True)
+        if dxgi in (24, 25):  # R10G10B10A2_UNORM / UINT
+            return w, h, _decode_dx10_r10g10b10a2(data[offset:], w, h)
+        if dxgi == 10:        # R16G16B16A16_FLOAT
+            return w, h, _decode_dx10_rgba_f16(data[offset:], w, h)
+        if dxgi == 2:         # R32G32B32A32_FLOAT
+            return w, h, _decode_dx10_rgba_f32(data[offset:], w, h)
+        if dxgi == 54:        # R16_FLOAT
+            return w, h, _decode_dx10_r16(data[offset:], w, h, is_float=True)
+        if dxgi == 55:        # R16_UNORM
+            return w, h, _decode_dx10_r16(data[offset:], w, h, is_float=False)
+        if dxgi == 41:        # R32_FLOAT
+            return w, h, _decode_dx10_r32(data[offset:], w, h, is_float=True)
+        if dxgi == 43:        # R32_UINT
+            return w, h, _decode_dx10_r32(data[offset:], w, h, is_float=False)
+        if dxgi in (61, 62):  # R8_UNORM / R8_UINT
+            return w, h, _decode_dx10_r8(data[offset:], w, h)
+
     # Unknown FourCC with small data: treat as raw pixel data, show as grayscale
     if info.compressed and info.format.startswith("FourCC:"):
         try:
@@ -308,6 +353,13 @@ def decode_dds_to_rgba(data: bytes) -> tuple[int, int, bytes]:
             pass
 
     raise ValueError(f"Unsupported DDS format for preview: {info.format}")
+
+
+def _dx10_dxgi_id(info: DdsInfo) -> int | None:
+    try:
+        return int(info.format.split("=")[1].rstrip(")"))
+    except (ValueError, IndexError):
+        return None
 
 
 def _decode_dxt1(data: bytes, width: int, height: int) -> bytes:
@@ -641,6 +693,158 @@ def _decode_luminance_16(data: bytes, width: int, height: int) -> bytes:
         rgba[p + 2] = v8
         rgba[p + 3] = 255
     return bytes(rgba)
+
+
+def _hdr_tonemap_to_u8(arr):
+    """Tone-map a non-negative-clamped float array to uint8 with gamma 1/2.2.
+
+    Normalizes by max value when max > 1 so HDR textures (reflection probes,
+    light data) still render with visible mid-tones.  Pure LDR data stored in
+    float (max <= 1) is gamma-corrected without rescaling.
+    """
+    import numpy as np
+    arr = np.clip(arr, 0.0, None)
+    if arr.size == 0:
+        return arr.astype(np.uint8)
+    mx = float(arr.max())
+    if mx > 1.0:
+        arr = arr * (1.0 / mx)
+    elif mx <= 1e-6:
+        return np.zeros(arr.shape, dtype=np.uint8)
+    arr = np.clip(arr, 0.0, 1.0) ** (1.0 / 2.2)
+    return (arr * 255.0 + 0.5).astype(np.uint8)
+
+
+def _decode_dx10_rgba8(data: bytes, width: int, height: int, swap_rb: bool) -> bytes:
+    """Decode DX10 RGBA8 / BGRA8 first mip to RGBA bytes."""
+    import numpy as np
+    expected = width * height * 4
+    pixels = np.frombuffer(data[:expected], dtype=np.uint8)
+    if pixels.size < expected:
+        return bytes(bytearray(expected))
+    pixels = pixels.reshape(height, width, 4)
+    if swap_rb:
+        pixels = pixels[..., [2, 1, 0, 3]]
+    return pixels.tobytes()
+
+
+def _decode_dx10_r10g10b10a2(data: bytes, width: int, height: int) -> bytes:
+    """Decode R10G10B10A2_UNORM/UINT first mip to RGBA bytes.
+
+    Each pixel is one little-endian uint32 packed as
+    [R:10, G:10, B:10, A:2] from LSB to MSB.  Channels scale to 8-bit.
+    """
+    import numpy as np
+    expected = width * height * 4
+    raw = np.frombuffer(data[:expected], dtype=np.uint32)
+    if raw.size < width * height:
+        return bytes(bytearray(expected))
+    r = (raw & 0x3FF)
+    g = (raw >> 10) & 0x3FF
+    b = (raw >> 20) & 0x3FF
+    a = (raw >> 30) & 0x3
+    out = np.empty((width * height, 4), dtype=np.uint8)
+    out[:, 0] = (r * 255 // 1023).astype(np.uint8)
+    out[:, 1] = (g * 255 // 1023).astype(np.uint8)
+    out[:, 2] = (b * 255 // 1023).astype(np.uint8)
+    out[:, 3] = (a * 85).astype(np.uint8)  # 0/85/170/255
+    return out.tobytes()
+
+
+def _decode_dx10_rgba_f16(data: bytes, width: int, height: int) -> bytes:
+    """Decode R16G16B16A16_FLOAT first mip to RGBA bytes (tone-mapped)."""
+    import numpy as np
+    expected = width * height * 4 * 2  # 4 channels x 2 bytes
+    halfs = np.frombuffer(data[:expected], dtype=np.float16)
+    if halfs.size < width * height * 4:
+        return bytes(bytearray(width * height * 4))
+    rgba = halfs.astype(np.float32).reshape(height, width, 4)
+    rgb = _hdr_tonemap_to_u8(rgba[..., :3])
+    a = np.clip(rgba[..., 3], 0.0, 1.0)
+    a8 = (a * 255.0 + 0.5).astype(np.uint8)
+    out = np.empty((height, width, 4), dtype=np.uint8)
+    out[..., :3] = rgb
+    out[..., 3] = a8
+    return out.tobytes()
+
+
+def _decode_dx10_rgba_f32(data: bytes, width: int, height: int) -> bytes:
+    """Decode R32G32B32A32_FLOAT first mip to RGBA bytes (tone-mapped)."""
+    import numpy as np
+    expected = width * height * 4 * 4
+    floats = np.frombuffer(data[:expected], dtype=np.float32)
+    if floats.size < width * height * 4:
+        return bytes(bytearray(width * height * 4))
+    rgba = floats.reshape(height, width, 4)
+    rgb = _hdr_tonemap_to_u8(rgba[..., :3])
+    a = np.clip(rgba[..., 3], 0.0, 1.0)
+    a8 = (a * 255.0 + 0.5).astype(np.uint8)
+    out = np.empty((height, width, 4), dtype=np.uint8)
+    out[..., :3] = rgb
+    out[..., 3] = a8
+    return out.tobytes()
+
+
+def _decode_dx10_r16(data: bytes, width: int, height: int, is_float: bool) -> bytes:
+    """Decode single-channel 16-bit DX10 to grayscale RGBA."""
+    import numpy as np
+    expected = width * height * 2
+    if is_float:
+        vals = np.frombuffer(data[:expected], dtype=np.float16).astype(np.float32)
+        v8 = _hdr_tonemap_to_u8(vals)
+    else:
+        u16 = np.frombuffer(data[:expected], dtype=np.uint16)
+        v8 = (u16 >> 8).astype(np.uint8)  # 0-65535 -> 0-255
+    if v8.size < width * height:
+        return bytes(bytearray(width * height * 4))
+    v8 = v8.reshape(height, width)
+    out = np.empty((height, width, 4), dtype=np.uint8)
+    out[..., 0] = v8
+    out[..., 1] = v8
+    out[..., 2] = v8
+    out[..., 3] = 255
+    return out.tobytes()
+
+
+def _decode_dx10_r32(data: bytes, width: int, height: int, is_float: bool) -> bytes:
+    """Decode single-channel 32-bit DX10 to grayscale RGBA."""
+    import numpy as np
+    expected = width * height * 4
+    if is_float:
+        vals = np.frombuffer(data[:expected], dtype=np.float32)
+        v8 = _hdr_tonemap_to_u8(vals)
+    else:
+        u32 = np.frombuffer(data[:expected], dtype=np.uint32)
+        if u32.size:
+            mx = max(1, int(u32.max()))
+            v8 = (u32 * 255 // mx).astype(np.uint8)
+        else:
+            v8 = u32.astype(np.uint8)
+    if v8.size < width * height:
+        return bytes(bytearray(width * height * 4))
+    v8 = v8.reshape(height, width)
+    out = np.empty((height, width, 4), dtype=np.uint8)
+    out[..., 0] = v8
+    out[..., 1] = v8
+    out[..., 2] = v8
+    out[..., 3] = 255
+    return out.tobytes()
+
+
+def _decode_dx10_r8(data: bytes, width: int, height: int) -> bytes:
+    """Decode R8_UNORM/UINT first mip to grayscale RGBA."""
+    import numpy as np
+    expected = width * height
+    src = np.frombuffer(data[:expected], dtype=np.uint8)
+    if src.size < expected:
+        return bytes(bytearray(width * height * 4))
+    src = src.reshape(height, width)
+    out = np.empty((height, width, 4), dtype=np.uint8)
+    out[..., 0] = src
+    out[..., 1] = src
+    out[..., 2] = src
+    out[..., 3] = 255
+    return out.tobytes()
 
 
 def _decode_raw_fallback(data: bytes, width: int, height: int, bpp: int) -> bytes:

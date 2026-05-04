@@ -37,6 +37,7 @@ from ui.dialogs.confirmation import show_error, show_info, confirm_action
 from utils.thread_worker import FunctionWorker
 from utils.platform_utils import format_file_size
 from utils.logger import get_logger
+from utils import text_search
 
 logger = get_logger("ui.tab_explorer")
 
@@ -86,7 +87,8 @@ class _ArchiveRow:
     type_desc is lazy-computed on first access (only visible rows need it).
     """
     __slots__ = ("entry", "group", "ext", "path_lower", "stem_lower", "size_raw",
-                 "_size_str", "_type_desc", "checked", "search_extra")
+                 "_size_str", "_type_desc", "checked", "search_extra",
+                 "search_display", "_display_tokens")
 
     def __init__(self, entry: PamtFileEntry, group: str):
         self.entry = entry
@@ -98,7 +100,27 @@ class _ArchiveRow:
         self._size_str = None
         self._type_desc = None
         self.checked = True
+        # Joined alias terms — display name + internal name + path tokens.
+        # Used by Tier B's plain substring filter (no tokenization needed
+        # because the alias builder includes both CamelCase and lowercase
+        # forms of every term — see ``core.item_index.build_item_index``).
         self.search_extra = ""
+        # Display-only alias terms. Used by Tier A token matching so the
+        # filter can suppress same-set sibling pieces (cloak/hand/foot)
+        # whose internal name shares the 'PlateArmor' CamelCase chain.
+        self.search_display = ""
+        # Lazy-built tokenized cache for ``search_display``. Populated on
+        # first Tier A match check, reused on every subsequent keystroke
+        # without re-running the tokenizer. Only the few thousand rows
+        # with item aliases ever build this cache; the bulk of the
+        # 1.4 M-row corpus uses Tier B's substring path which never
+        # tokenizes.
+        self._display_tokens: set[str] | None = None
+
+    def _get_display_tokens(self) -> set[str]:
+        if self._display_tokens is None:
+            self._display_tokens = text_search.tokens_for(self.search_display)
+        return self._display_tokens
 
     @property
     def size_str(self) -> str:
@@ -175,7 +197,32 @@ class _ArchiveModel(QAbstractTableModel):
 
         use_glob = "*" in search_text or "?" in search_text
 
-        result = []
+        # Two-tier matching for non-glob queries, designed for the
+        # 1.4 M-row hot loop:
+        #   Tier A — token match against row.search_display only.
+        #     Most rows have empty search_display (no item alias attached)
+        #     so this is a cheap ``if not row.search_display: skip``.
+        #     The few thousand rows that DO have a display alias get a
+        #     lazily-cached token set so subsequent keystrokes reuse the
+        #     work.
+        #   Tier B — plain substring match against path_lower and
+        #     search_extra. This is the same C-fast ``in`` check the
+        #     pre-1.24.0 filter used and is what keeps the loop under one
+        #     frame per keystroke on real hardware. Tier A's purpose is
+        #     to suppress false-positive Tier B hits for English item-
+        #     name queries (the canta-plate-armor-vs-eccanta case);
+        #     Tier B's purpose is to stay fast for raw-path queries.
+        # If any row qualifies for Tier A we return only Tier A so
+        # 'canta plate armor' resolves to just the chest piece's files
+        # without the eccanta / cantarts substring noise. Otherwise we
+        # fall through to Tier B and surface every substring hit.
+        tier_a: list[int] = []
+        tier_b: list[int] = []
+        token_query = bool(search_text) and not use_glob
+        # Tokenize the query exactly once per filter pass; per-row
+        # display-token sets are lazily cached on the row itself.
+        q_tokens = text_search.tokenize(search_text) if token_query else []
+
         for i, row in enumerate(self._all_rows):
             if scoped_paths is not None and row.path_lower not in scoped_paths:
                 continue
@@ -190,10 +237,35 @@ class _ArchiveModel(QAbstractTableModel):
                         or (row.search_extra and _fn.fnmatch(row.search_extra, search_text))
                     ):
                         continue
-                elif search_text not in row.path_lower and search_text not in row.search_extra:
+                    tier_b.append(i)
+                else:
+                    # Tier A: display-name token match (only for rows
+                    # that actually have a display alias — typically
+                    # well under 1% of the 1.4 M corpus).
+                    if row.search_display and text_search.match_prefilter(
+                        q_tokens, row._get_display_tokens()
+                    ):
+                        tier_a.append(i)
+                        continue
+                    # Tier B: plain substring fallback — same hot-path
+                    # cost as the pre-1.24.0 filter. ``search_extra``
+                    # already carries both the original CamelCase and the
+                    # lowercased form of every alias term (see
+                    # ``core.item_index.build_item_index``), so this match
+                    # works case-insensitively without needing a ``.lower()``
+                    # call per row per keystroke.
+                    if search_text in row.path_lower or (
+                        row.search_extra and search_text in row.search_extra
+                    ):
+                        tier_b.append(i)
                     continue
-            result.append(i)
-        self._filtered = result
+            else:
+                tier_b.append(i)
+
+        if token_query and tier_a:
+            self._filtered = tier_a
+        else:
+            self._filtered = tier_a + tier_b if token_query else tier_b
 
     def row_at(self, view_row: int) -> _ArchiveRow:
         if 0 <= view_row < len(self._filtered):
@@ -314,6 +386,12 @@ class ExplorerTab(QWidget):
         self._all_groups: list[str] = []
         self._worker: FunctionWorker = None
         self._item_index = None
+        # Pre-built catalog with display names + icon paths populated,
+        # owned by the Explorer tab so the Catalog Browser dialog can
+        # open instantly without re-running ``build_item_catalog_cached``.
+        self._item_catalog = None
+        self._catalog_loading = False
+        self._catalog_worker: FunctionWorker | None = None
         self._current_edit_file = ""
         self._pending_mesh_data: dict[str, dict] = {}
         self._temp_dir = tempfile.mkdtemp(prefix="crimsonforge_preview_")
@@ -386,6 +464,28 @@ class ExplorerTab(QWidget):
         )
         self._search_input.textChanged.connect(lambda _: self._search_timer.start())
         toolbar.addWidget(self._search_input, 1)
+
+        # Catalog browser button — opens a popup with the categorised
+        # image grid of every iteminfo / multichange record (~7 k
+        # canonical items pre-classified into Weapon -> Sword/Bow/Mace/...,
+        # Armor -> Helm/Body/Hands/Feet/Back/..., Mount & Pet Gear,
+        # Materials, etc.). Click an item to scope the file list below
+        # to that item's PAC + sidecar files (same effect as typing the
+        # item's stem into the search bar).
+        from PySide6.QtWidgets import QStyle
+        self._catalog_btn = QPushButton("Catalog")
+        self._catalog_btn.setIcon(self.style().standardIcon(
+            QStyle.StandardPixmap.SP_FileDialogContentsView
+        ))
+        self._catalog_btn.setToolTip(
+            "Browse the full item catalog as an image grid.\n"
+            "All armor, weapons, mount & pet gear and materials, "
+            "categorised by Weapon -> Sword/Bow/Mace/...,\n"
+            "Armor -> Helm/Body/Hands/Feet/Back/Face. "
+            "Click an item to scope the file list below to its files."
+        )
+        self._catalog_btn.clicked.connect(self._open_catalog_browser)
+        toolbar.addWidget(self._catalog_btn)
 
         self._navigator_btn = QPushButton("Navigator")
         self._navigator_btn.setObjectName("primary")
@@ -617,7 +717,13 @@ class ExplorerTab(QWidget):
         )
 
     def _load_item_index(self) -> None:
-        """Build the item-name search index from live game data."""
+        """Build the item-name search index from live game data.
+
+        Also kicks off an asynchronous catalog rebuild so the Catalog
+        Browser dialog opens instantly without freezing the UI on a
+        20-second iteminfo + icon-discovery scan when the user clicks
+        the catalog button.
+        """
         if not self._vfs:
             return
 
@@ -636,6 +742,53 @@ class ExplorerTab(QWidget):
             logger.warning("Item search index unavailable: %s", e)
             self._progress.set_status(f"Item search unavailable: {e}")
 
+        # Kick the catalog build off in the background. The catalog
+        # browser dialog needs the icon-paths-enriched catalog the
+        # heavier `core.item_catalog.build_item_catalog_cached` builds;
+        # doing it now (rather than at first dialog open) means the
+        # user never sees a blank dialog while we crunch ~7,500 PAMT
+        # icon entries against ~19,700 item records.
+        self._kick_off_catalog_build()
+
+    def _kick_off_catalog_build(self) -> None:
+        """Schedule an async catalog rebuild and update button state."""
+        self._item_catalog = None
+        self._catalog_loading = True
+        if hasattr(self, "_catalog_btn"):
+            self._catalog_btn.setEnabled(False)
+            self._catalog_btn.setToolTip("Catalog loading…")
+
+        def _bg(_worker: FunctionWorker, vfs):
+            from core.item_catalog import build_item_catalog_cached
+            return build_item_catalog_cached(vfs)
+
+        def _done(data):
+            self._item_catalog = data
+            self._catalog_loading = False
+            if hasattr(self, "_catalog_btn"):
+                self._catalog_btn.setEnabled(True)
+                self._catalog_btn.setToolTip(
+                    "Browse the full item catalog as an image grid.\n"
+                    "All armor, weapons, mount & pet gear and materials, "
+                    "categorised by Weapon -> Sword/Bow/Mace/...,\n"
+                    "Armor -> Helm/Body/Hands/Feet/Back/Face. "
+                    "Same two-tier search as the file list above."
+                )
+
+        def _failed(message: str):
+            self._item_catalog = None
+            self._catalog_loading = False
+            if hasattr(self, "_catalog_btn"):
+                self._catalog_btn.setEnabled(True)
+                self._catalog_btn.setToolTip(f"Catalog unavailable: {message}")
+            logger.warning("Catalog build failed: %s", message)
+
+        # Hold a reference on the tab so the QThread isn't GC'd mid-run.
+        self._catalog_worker = FunctionWorker(_bg, self._vfs)
+        self._catalog_worker.finished_result.connect(_done)
+        self._catalog_worker.error_occurred.connect(_failed)
+        self._catalog_worker.start()
+
     def _build_row(self, entry: PamtFileEntry, group: str) -> _ArchiveRow:
         """Create one archive row and attach item-name aliases when available."""
         row = _ArchiveRow(entry, group)
@@ -643,14 +796,23 @@ class ExplorerTab(QWidget):
             return row
 
         aliases = []
+        display_aliases = []
         seen = set()
+        seen_display = set()
+        display_map = getattr(self._item_index, "model_display_aliases", None) or {}
         for key in self._candidate_item_alias_keys(row.stem_lower):
             alias = self._item_index.model_base_aliases.get(key)
             if alias and alias not in seen:
                 seen.add(alias)
                 aliases.append(alias)
+            disp = display_map.get(key)
+            if disp and disp not in seen_display:
+                seen_display.add(disp)
+                display_aliases.append(disp)
         if aliases:
             row.search_extra = " ".join(aliases)
+        if display_aliases:
+            row.search_display = " ".join(display_aliases)
         return row
 
     def _candidate_item_alias_keys(self, stem_lower: str) -> list[str]:
@@ -778,6 +940,96 @@ class ExplorerTab(QWidget):
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
+
+    def _open_catalog_browser(self):
+        """Open the categorised image-grid item browser dialog.
+
+        Uses the catalog that was pre-built when the game data
+        loaded — no I/O on the GUI thread, no blank-dialog wait.
+        Lazy-imported so launching the Explorer tab itself never pays
+        the QListView / QPixmapCache / threadpool startup cost.
+        """
+        if not self._vfs:
+            show_error(self, "Catalog Browser", "Load the game data first.")
+            return
+        if self._catalog_loading or self._item_catalog is None:
+            show_error(self, "Catalog Browser",
+                        "Catalog is still loading — try again in a moment.")
+            return
+        from ui.dialogs.catalog_browser_dialog import CatalogBrowserDialog
+        dialog = CatalogBrowserDialog(
+            self._vfs, catalog=self._item_catalog, parent=self,
+        )
+        # Single click in the catalog scopes the main file list live —
+        # same behavior the user expects from "search like main search".
+        # Double click does the same thing AND closes the dialog (a
+        # commit-and-leave shortcut).
+        dialog.item_picked.connect(self._scope_to_catalog_selection)
+        dialog.item_activated.connect(self._scope_to_catalog_selection)
+        dialog.exec()
+
+    def _scope_to_catalog_selection(self, selection):
+        """Filter Explorer to every file connected to the picked item.
+
+        Builds the scope from the record's PAC files plus its icon
+        paths plus any sister `.pam` / `.pamlod` / `.pac_xml` /
+        `.app_xml` / `.prefabdata_xml` / DDS texture file that lives
+        under the same stem in the loaded VFS. The Explorer's existing
+        ``_apply_workbench_scope`` then takes care of switching to All
+        Packages and surfacing only those rows.
+
+        Any leftover text in the main search bar is cleared first —
+        otherwise the scope's path list is intersected with the search
+        substring and the user sees an empty file list whenever their
+        previous search query doesn't happen to match any of the
+        scoped files.
+        """
+        if not selection or not self._vfs:
+            return
+        # Clear the active search so the scope is the sole filter.
+        # ``blockSignals`` keeps the text-change handler from firing an
+        # extra refilter — ``_apply_workbench_scope`` triggers one
+        # explicitly below.
+        if self._search_input.text():
+            self._search_input.blockSignals(True)
+            try:
+                self._search_input.setText("")
+            finally:
+                self._search_input.blockSignals(False)
+            self._search_timer.stop()
+        record = selection.record
+        scope_paths: list[str] = []
+        # PAC files first — exact paths from the catalog.
+        scope_paths.extend(record.pac_files)
+        # Icon DDS paths next — exact PAMT paths populated by the catalog
+        # builder.
+        scope_paths.extend(record.icon_paths)
+        # Sister files — every entry in any loaded PAMT whose path
+        # contains the bare stem of any of the record's pac files.
+        # Conservative: only entries that share the full pre-extension
+        # stem so we don't pull in 100 unrelated regional variants.
+        stems = []
+        for pac in record.pac_files:
+            stem = pac.replace("\\", "/").rsplit("/", 1)[-1]
+            if stem.lower().endswith(".pac"):
+                stem = stem[:-4]
+            if stem and stem not in stems:
+                stems.append(stem.lower())
+        # Walk the model's prebuilt rows (one per archive entry) for sister
+        # files whose path contains any of the record's pac stems. The model
+        # owns the row list — accessing it directly is the same pattern the
+        # tab uses elsewhere for scope operations.
+        if self._model is not None and stems:
+            for row in self._model._all_rows:
+                for stem in stems:
+                    if stem in row.path_lower:
+                        if row.entry.path not in scope_paths:
+                            scope_paths.append(row.entry.path)
+                        break
+        if not scope_paths:
+            return
+        title = record.display_name or record.internal_name or "Catalog selection"
+        self._apply_workbench_scope(scope_paths, preferred_path="", title=title)
 
     def _apply_workbench_scope(self, paths: list[str], preferred_path: str = "", title: str = ""):
         normalized = []

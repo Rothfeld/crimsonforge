@@ -773,13 +773,42 @@ class PreviewPane(QWidget):
             return QPixmap()
 
     def _show_text(self, path: str) -> None:
+        """Show a text-style file in the read-only preview pane.
+
+        Handles encoding sniffing because Pearl Abyss's encrypted-XML
+        sidecars (``.pac_xml``, ``.app_xml``, ``.prefabdata_xml``,
+        ``.pami``, ``.spline``, ``.mi``) ship UTF-8 with a leading BOM
+        (``EF BB BF``), and a plain ``encoding='utf-8'`` decoder leaves
+        that BOM as a literal ``\\ufeff`` character at the start of the
+        string — which QPlainTextEdit renders as an invisible / boxy
+        glyph that pushes the rest of the content off-screen on some
+        Qt builds and makes the file look like it isn't loading.
+
+        Strategy: read the bytes once, then walk a short list of
+        encodings starting with ``utf-8-sig`` (which silently strips
+        the UTF-8 BOM) and falling back through ``utf-16`` and
+        ``cp1252`` so any future game-file encoding still renders. The
+        first successful decode wins.
+        """
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read(2 * 1024 * 1024)
-            self._text_edit.setPlainText(content)
-            self._stack.setCurrentIndex(IDX_TEXT)
+            with open(path, "rb") as f:
+                raw = f.read(2 * 1024 * 1024)
         except Exception as e:
             self._show_empty(f"Cannot read file: {e}")
+            return
+
+        content = None
+        for enc in ("utf-8-sig", "utf-16", "utf-8", "cp1252"):
+            try:
+                content = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        if content is None:
+            content = raw.decode("utf-8", errors="replace")
+
+        self._text_edit.setPlainText(content)
+        self._stack.setCurrentIndex(IDX_TEXT)
 
     def _show_pabgb_table(self, path: str) -> None:
         """Preview a .pabgb game-data table as a formatted text summary."""

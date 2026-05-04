@@ -31,7 +31,16 @@ class ItemRecord:
 class ItemIndex:
     items: list[ItemRecord]
     pac_to_items: dict[str, list[ItemRecord]]
+    # Joined search corpus per model base — display + internal + path tokens.
+    # Used for general substring / prefix matching.
     model_base_aliases: dict[str, str]
+    # Subset of the above that holds ONLY the user-facing display names per
+    # base. Searches that can be satisfied by display-name tokens alone are
+    # restricted to this map so e.g. ``canta plate armor`` returns just the
+    # chest piece (display 'Canta Plate Armor') without dragging in the
+    # cloak / hand / foot variants whose internal name shares the
+    # 'PlateArmor' set token but whose display name is different.
+    model_display_aliases: dict[str, str] = field(default_factory=dict)
 
 
 def _find_entry(vfs: VfsManager, group: str, needle: str):
@@ -136,8 +145,11 @@ def parse_iteminfo(vfs: VfsManager, loc_dict: dict[str, str], progress_fn=None) 
 
         prefab_hashes: list[int] = []
         search_end = min(len(data), pos + 800)
+        # The May 3 2026 game patch changed the iteminfo prefab-block
+        # marker from 0x0E to 0x0F. Old delimiter kept as a fallback for
+        # users on a pre-patch game install.
         for scan in range(pos + 14, search_end - 15):
-            if data[scan] != 0x0E:
+            if data[scan] != 0x0F and data[scan] != 0x0E:
                 continue
             count1 = struct.unpack_from("<I", data, scan + 3)[0]
             count2 = struct.unpack_from("<I", data, scan + 7)[0]
@@ -193,6 +205,7 @@ def build_item_index(vfs: VfsManager, progress_fn=None) -> ItemIndex:
 
     pac_to_items: dict[str, list[ItemRecord]] = {}
     model_base_aliases: dict[str, str] = {}
+    model_display_aliases: dict[str, str] = {}
     items_with_models: list[ItemRecord] = []
 
     for item in items:
@@ -212,8 +225,16 @@ def build_item_index(vfs: VfsManager, progress_fn=None) -> ItemIndex:
                 item.pac_files.append(pac_name)
             pac_to_items.setdefault(pac_name, []).append(item)
 
+            # Include the ORIGINAL CamelCase ``internal_name`` alongside its
+            # lowercased form. The Explorer search bar uses a CamelCase-aware
+            # tokenizer (``utils.text_search``) and needs the case boundary
+            # preserved so that ``Canta_PlateArmor_Armor`` splits cleanly into
+            # ``canta plate armor armor`` instead of being collapsed to the
+            # single token ``canta_platearmor_armor`` once lowercased.
             terms = " ".join(
                 token for token in (
+                    item.display_name,
+                    item.internal_name,
                     item.display_name.lower(),
                     item.internal_name.lower(),
                     base.lower(),
@@ -223,6 +244,22 @@ def build_item_index(vfs: VfsManager, progress_fn=None) -> ItemIndex:
             existing = model_base_aliases.get(base, "")
             merged = f"{existing} {terms}".strip() if existing else terms
             model_base_aliases[base] = merged
+
+            # Display-only alias: lets the Explorer filter restrict matches
+            # to rows whose user-facing item name actually contains every
+            # query token. Without this, set names like ``Canta_PlateArmor``
+            # that share the ``Plate Armor`` token chain across cloak / hand
+            # / foot variants would all match a query of 'canta plate armor'
+            # because the internal name's CamelCase split injects ``Armor``
+            # into every variant. The display name is the cleaner signal of
+            # which slot the user actually meant.
+            if item.display_name:
+                existing_disp = model_display_aliases.get(base, "")
+                merged_disp = (
+                    f"{existing_disp} {item.display_name}".strip()
+                    if existing_disp else item.display_name
+                )
+                model_display_aliases[base] = merged_disp
 
         if item.display_name and item.pac_files:
             items_with_models.append(item)
@@ -234,4 +271,5 @@ def build_item_index(vfs: VfsManager, progress_fn=None) -> ItemIndex:
         items=items_with_models,
         pac_to_items=pac_to_items,
         model_base_aliases=model_base_aliases,
+        model_display_aliases=model_display_aliases,
     )
